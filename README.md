@@ -6,6 +6,8 @@ The core architecture utilizes a **Time-Series Joint Embedding Predictive Archit
 ### 🛠️ Development & Tooling Disclosure
 Architected and directed by the author, with optimization, boilerplate compilation, and documentation formatting co-piloted by Google Gemini. All structural research boundaries (patient-level validation isolation, physiological-bounded scaling, and multi-modal ablation mechanics) were strictly designed and verified by the author.
 
+Training locally on **RTX 4060Ti 16GB VRAM**.
+
 ---
 
 ## 🔬 Core Architecture & Technical Highlights
