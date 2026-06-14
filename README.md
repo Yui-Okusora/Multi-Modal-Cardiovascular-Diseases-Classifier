@@ -60,8 +60,6 @@ Constructs a unified text prompt using a specialized clinical template:
 
 To ensure complete structural transparency for code audits and academic peer reviews, the exact specifications of the data shapes, label mapping, and native PyTorch layer topologies are detailed below.
 
----
-
 ### 1. Model Input Channels & Target Specifications
 
 The model processes two distinct input modalities which are projected and fused before entering the classification pipeline. The ground-truth diagnostic targets are kept strictly isolated from the feature space.
