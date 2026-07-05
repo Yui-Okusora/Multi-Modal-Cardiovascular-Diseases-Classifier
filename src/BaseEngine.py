@@ -189,7 +189,7 @@ class BaseExecutionEngine:
                     print(
                         f"⚡ [{tag:<12}] E{epoch+1:02d} B{batch_idx:03d}/{len(data_loader):03d} │ "
                         f"L_tot: {total_loss.item():.4f} │ G: {grad_norm:5.2f} │ "
-                        f"LR: {current_lr:.1e} │ {vram_usage_gb:.1f}GB │ {samples_per_sec:.0f}s/s │ "
+                        f"LR: {current_lr:.1e} │ {vram_usage_gb:.1f}GB │ {samples_per_sec:.0f}sam/s\n"
                         f"🧬 {comp_str}"
                     )
                           

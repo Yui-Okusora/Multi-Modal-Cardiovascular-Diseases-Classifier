@@ -266,7 +266,7 @@ def execute_clinical_audit(targets, probabilities, thresholds=None, min_positive
     # 🎯 TIER 2: HARD DECISION METRICS (Threshold Calibration)
     # -----------------------------------------------------------------
     # Add an explicit calibration toggle check (defaulting to False for row-wise safety)
-    calibrate_per_class = False 
+    calibrate_per_class = True 
     
     if thresholds is None:
         # Enforce a true, flat global default anchor across all 456 tracks
@@ -328,17 +328,10 @@ def execute_clinical_audit(targets, probabilities, thresholds=None, min_positive
     # -----------------------------------------------------------------
     top1_count = 0
     top3_count = 0
-    top5_count = 0  # 🎯 Added to track the broader clinical diagnostic window
+    top5_count = 0  
     
-    eps = 1e-7
-    probs_clamped = np.clip(probabilities, eps, 1.0 - eps)
-    thresh_clamped = np.clip(thresholds, eps, 1.0 - eps)
-    
-    logit_probs = np.log(probs_clamped / (1.0 - probs_clamped))
-    logit_thresh = np.log(thresh_clamped / (1.0 - thresh_clamped))
-    
-    # Distance from decision boundary preserves the precise intra-patient distribution shape
-    normalized_scores = logit_probs - logit_thresh
+    # 🛠️ THE FIX: Sort directly by raw probabilities to preserve true intra-patient rankings
+    normalized_scores = probabilities 
     
     for i in range(num_samples):
         # Sort indices by model confidence in descending order
@@ -348,7 +341,7 @@ def execute_clinical_audit(targets, probabilities, thresholds=None, min_positive
             top1_count += 1
         if np.any(targets[i, top_indices[:3]] == 1.0):
             top3_count += 1
-        if np.any(targets[i, top_indices[:5]] == 1.0):  # 🎯 Check if true target falls in top 5
+        if np.any(targets[i, top_indices[:5]] == 1.0):  
             top5_count += 1
             
     top1_rate = (top1_count / num_samples) * 100
@@ -361,16 +354,16 @@ def execute_clinical_audit(targets, probabilities, thresholds=None, min_positive
     print("\n" + "═"*70)
     print(" 🏥 COMPREHENSIVE CLINICAL MANIFOLD AUDIT REPORT")
     print("═"*70)
-    print(f" 🩺 [TIER 1: RANKING]   Macro AUC-ROC:          {macro_auc_roc:.2f}%")
-    print(f" 🩺 [TIER 1: RANKING]   Macro AUC-PR (Sparsity):{macro_auc_pr:.2f}%")
+    print(f" 🩺 [TIER 1: RANKING]   Macro AUC-ROC:          {macro_auc_roc:3.2f}%")
+    print(f" 🩺 [TIER 1: RANKING]   Macro AUC-PR (Sparsity):{macro_auc_pr:3.2f}%")
     print("-" * 70)
-    print(f" 🛡️ [TIER 2: BOUNDARY]  Calibrated Macro F1:    {macro_f1 * 100:.2f}%")
-    print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Precision:        {macro_p * 100:.2f}%")
-    print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Sensitivity (TPR):{macro_sens:.2f}%")
-    print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Specificity (TNR):{macro_spec:.2f}%")
+    print(f" 🛡️ [TIER 2: BOUNDARY]  Calibrated Macro F1:    {macro_f1 * 100:3.2f}%")
+    print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Precision:        {macro_p * 100:3.2f}%")
+    print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Sensitivity (TPR):{macro_sens:3.2f}%")
+    print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Specificity (TNR):{macro_spec:3.2f}%")
     print("-" * 70)
-    print(f" ⚡ [TIER 3: WORKFLOW]  Top-1 Primary Hit Rate: {top1_rate:.2f}%")
-    print(f" ⚡ [TIER 3: WORKFLOW]  Top-3 Differential Rate:{top3_rate:.2f}%")
-    print(f" ⚡ [TIER 3: WORKFLOW]  Top-5 Differential Rate:{top5_rate:.2f}%")  # Render Top-5
+    print(f" ⚡ [TIER 3: WORKFLOW]  Top-1 Primary Hit Rate: {top1_rate:3.2f}%")
+    print(f" ⚡ [TIER 3: WORKFLOW]  Top-3 Differential Rate:{top3_rate:3.2f}%")
+    print(f" ⚡ [TIER 3: WORKFLOW]  Top-5 Differential Rate:{top5_rate:3.2f}%")  # Render Top-5
     print("═"*70 + "\n")
     
