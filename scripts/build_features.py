@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import re
 import json
-import os
+from config import CardioConfig
 
 CLINICAL_BOUNDS = {
     'sbp': (70.0, 200.0),       
@@ -99,8 +99,10 @@ if __name__ == "__main__":
     np.random.shuffle(all_patients)
     split = int(len(all_patients) * 0.8)
     train_mabns = set(all_patients[:split])
+
+    cfg = CardioConfig()
     
-    MAX_SEQ_LEN = 128  
+    MAX_SEQ_LEN = cfg.max_sequence_len  
     train_flattened_rows, val_flattened_rows = [], []
     
     # Telemetry Counter Blocks
@@ -192,34 +194,52 @@ if __name__ == "__main__":
         icd_ids = [icd_codebook[code] for code in encounter_codes if code in icd_codebook]
         if not icd_ids: continue
 
-        # 🚀 OFFLINE TRAJECTORY UNROLLING PASS
-        # Generate an independent row for every step position along the patient's timeline
-        for step_idx in range(1, len(dynamic_events_pool)):
-            # Retain history up to the current sliding window index
-            active_history = dynamic_events_pool[:step_idx + 1]
+        # 🚀 STRATEGIC TRAJECTORY PROCESSING BIFURCATION
+        if is_train:
+            # 🔹 TRAINING PATH: Unroll completely into sequential step windows for sample augmentation
+            for step_idx in range(1, len(dynamic_events_pool)):
+                active_history = dynamic_events_pool[:step_idx + 1]
+                
+                if len(active_history) > (MAX_SEQ_LEN - 2):
+                    active_history = active_history[-(MAX_SEQ_LEN - 2):]
+                    
+                final_timeline = [
+                    (0.0, feature_codebook['tuoi'], float(normalized_age), 0),
+                    (0.0, feature_codebook['phai'], 0.0, int(gender_cat_id))
+                ] + active_history
+                
+                record = {
+                    'mabn': f"patient_{censored_mabn_id}_step_{step_idx}",
+                    'cutoff_idx': step_idx,
+                    'timestamps': " ".join([str(e[0]) for e in final_timeline]),
+                    'feature_ids': " ".join([str(e[1]) for e in final_timeline]),
+                    'numeric_values': " ".join([str(e[2]) for e in final_timeline]),
+                    'cat_result_ids': " ".join([str(e[3]) for e in final_timeline]),
+                    'icd_targets': " ".join([str(i) for i in icd_ids])
+                }
+                train_flattened_rows.append(record)
+        else:
+            # 🔸 VALIDATION PATH: DO NOT UNROLL. Extract exclusively the single terminal complete sequence
+            active_history = dynamic_events_pool
             
-            # Enforce strict truncation bounds
             if len(active_history) > (MAX_SEQ_LEN - 2):
                 active_history = active_history[-(MAX_SEQ_LEN - 2):]
                 
-            # Prepend static demographics descriptors to the sequence array
             final_timeline = [
                 (0.0, feature_codebook['tuoi'], float(normalized_age), 0),
                 (0.0, feature_codebook['phai'], 0.0, int(gender_cat_id))
             ] + active_history
             
             record = {
-                'mabn': f"patient_{censored_mabn_id}_step_{step_idx}",
-                'cutoff_idx': step_idx,  # Tracking pointer for the mask constructor
+                'mabn': f"patient_{censored_mabn_id}_terminal",
+                'cutoff_idx': len(dynamic_events_pool) - 1,
                 'timestamps': " ".join([str(e[0]) for e in final_timeline]),
                 'feature_ids': " ".join([str(e[1]) for e in final_timeline]),
                 'numeric_values': " ".join([str(e[2]) for e in final_timeline]),
                 'cat_result_ids': " ".join([str(e[3]) for e in final_timeline]),
                 'icd_targets': " ".join([str(i) for i in icd_ids])
             }
-            
-            if is_train: train_flattened_rows.append(record)
-            else: val_flattened_rows.append(record)
+            val_flattened_rows.append(record)
 
     # Export the pre-flattened datasets to disk
     pd.DataFrame(train_flattened_rows).to_csv("train_patient_flattened.csv", index=False)

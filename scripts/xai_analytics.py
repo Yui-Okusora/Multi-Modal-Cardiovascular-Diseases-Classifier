@@ -43,26 +43,20 @@ class AdvancedClinicalAnalyticsEngine:
         )
         self.target_class = 16  # Primary cardiovascular tracking channel
 
-    def _load_pipeline(self):
-        print("🏭 Instantiating Clinical Pipeline Core Framework...")
-        pipeline = ClinicalPipeline(self.cfg, self.device)
-        checkpoint_path = os.path.join(self.cfg.checkpoint_dir, "unified_jepa_and_probe.pt")
-        
-        if os.path.exists(checkpoint_path):
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            pipeline.context_encoder.load_state_dict(checkpoint["context_encoder_state"])
-            pipeline.predictor.load_state_dict(checkpoint["predictor_state"])
-            pipeline.linear_probe.load_state_dict(checkpoint["linear_probe_state"])
-            print("🎯 Model checkpoint weights completely restored and synced.")
-        else:
-            print("⚠️ Checkpoint file missing. Running engine via random initialization.")
-        
-        pipeline.context_encoder.eval()
-        pipeline.predictor.eval()
-        pipeline.linear_probe.eval()
-        return pipeline
-
     def calculate_latent_metrics(self, z_matrix: torch.Tensor):
+        """
+        🔬 LATENT GEOMETRY CALCULATION HEAD:
+        Upgraded with full float32 isolation and non-finite value intercept shields
+        to guarantee singular value decomposition (SVD) stability.
+        """
+        # 🛡️ SYSTEM SHIELD: Force conversion to full float32 precision
+        z_matrix = z_matrix.float()
+        
+        # 🛡️ DATA SANITIZER: Catch and scrub any random non-finite value remnants
+        if not torch.isfinite(z_matrix).all():
+            print("⚠️ [SVD PROTECTION] Non-finite entries detected in manifold matrix. Applying sanitizer cleanups...")
+            z_matrix = torch.nan_to_num(z_matrix, nan=0.0, posinf=1.0, neginf=-1.0)
+
         z_centered = z_matrix - z_matrix.mean(dim=0, keepdim=True)
         _, S, _ = torch.linalg.svd(z_centered, full_matrices=False)
         p = S / (S.sum() + 1e-10)
@@ -71,7 +65,8 @@ class AdvancedClinicalAnalyticsEngine:
         return eff_rank, sparsity_index
 
     def execute_evaluation_loop(self):
-        pipeline = self._load_pipeline()
+        pipeline = ClinicalPipeline(self.cfg, self.cfg.device)
+        pipeline.load_checkpoint(checkpoint_path = os.path.join(self.cfg.checkpoint_dir, "unified_jepa_and_probe.pt"))
         print("⚡ Processing population arrays and intercepting gradient pathways...")
 
         def captum_forward(f, v, c, t, s_mask):
@@ -111,7 +106,8 @@ class AdvancedClinicalAnalyticsEngine:
         for batch_idx, batch in enumerate(self.val_loader):
             # 🛡️ NO-GRAD ACCELERATION PASS FOR GLOBAL FEATURES
             with torch.no_grad():
-                with torch.amp.autocast('cuda', dtype=torch.float16):
+                # 🚀 UPGRADE: Swapped out float16 for bfloat16 to match your training environment limits
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                     out = pipeline.process_batch(batch, self.device)
             
             z_slots_accum.append(out['z_hat_slots'].detach().float().cpu())  
@@ -125,11 +121,16 @@ class AdvancedClinicalAnalyticsEngine:
 
             # Counterfactual Risk Pass
             with torch.no_grad():
-                with torch.amp.autocast('cuda', dtype=torch.float16):
-                    orig_probs = torch.sigmoid(captum_forward(f_ids_b, v_nums_b, c_ids_b, times_b, s_mask_b))[:, self.target_class].cpu().numpy()
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    # 🛡️ SHIELD: Cast to .float() before calling .cpu().numpy() to prevent array type crashes
+                    orig_probs = torch.sigmoid(captum_forward(f_ids_b, v_nums_b, c_ids_b, times_b, s_mask_b))[:, self.target_class].float().cpu().numpy()
+                    
                     f_ids_mod = f_ids_b.clone()
                     f_ids_mod[:, f_ids_mod.size(1)//2:] = 0  
-                    mod_probs = torch.sigmoid(captum_forward(f_ids_mod, v_nums_b, c_ids_b, times_b, s_mask_b))[:, self.target_class].cpu().numpy()
+                    
+                    # 🛡️ SHIELD: Cast to .float() here as well
+                    mod_probs = torch.sigmoid(captum_forward(f_ids_mod, v_nums_b, c_ids_b, times_b, s_mask_b))[:, self.target_class].float().cpu().numpy()
+                    
             cohort_counterfactual_deltas.extend((mod_probs - orig_probs) * 100)
 
             # Single-sample micro-loops process items safely without graph bloat
@@ -137,13 +138,16 @@ class AdvancedClinicalAnalyticsEngine:
                 f_s, v_s, c_s = f_ids_b[p_idx:p_idx+1], v_nums_b[p_idx:p_idx+1], c_ids_b[p_idx:p_idx+1]
                 t_s, m_s = times_b[p_idx:p_idx+1], s_mask_b[p_idx:p_idx+1]
 
+                # Integrated Gradients run in full float32 for backpropagation attribution consistency
                 ig_attr = lig.attribute(inputs=(f_s, v_s, c_s, t_s, m_s), target=self.target_class, n_steps=12, internal_batch_size=2)[0].detach().cpu().numpy()
                 cohort_ig_curves.append(np.sum(np.abs(ig_attr), axis=-1))
 
                 attn_maps.clear()
                 handle = target_attn_block.register_forward_hook(attn_hook)
                 with torch.no_grad(): 
-                    _ = captum_forward(f_s, v_s, c_s, t_s, m_s)
+                    # 🚀 UPGRADE: Match attention extraction targets to bfloat16 activation limits
+                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                        _ = captum_forward(f_s, v_s, c_s, t_s, m_s)
                 handle.remove()
                 if attn_maps:
                     heatmap_data = attn_maps[0][0]
@@ -225,6 +229,8 @@ class AdvancedClinicalAnalyticsEngine:
         sns.histplot(cf_deltas, kde=True, color="#e74c3c", bins=40, edgecolor='white', alpha=0.7)
         plt.axvline(0, color='black', linewidth=1.2, linestyle='--')
         plt.title("Population Counterfactual Risk Modulation Spectrum", fontweight='bold')
+        # 🤝 ALIGNED LABEL TYPO FIX
+        plt.xlabel("Risk Probability Delta Shift (%)")
         plt.grid(True, linestyle=":")
         plt.tight_layout()
         plt.savefig("./xai_exports/population_counterfactual_spectrum.png", dpi=300)

@@ -32,14 +32,14 @@ class CardioConfig:
     
     # Optimization Learning Velocity Constraints
     pretrain_lr: float = 4.2e-4              # Conservative pretraining learning rate for coordinate scaling
-    pretrain_epochs: int = 2              # Epoch loops allowing associative valleys to organize
+    pretrain_epochs: int = 5              # Epoch loops allowing associative valleys to organize
     pretrain_wgt_decay: float = 1e-2       # L2 regularization factor over trainable matrices
     
     #==================== Phase 2 =================
     # Optimization Learning Velocity Constraints
     probe_lr: float = 1.4e-3                # Slightly increased to accelerate initial coordinate transitions
-    probe_epochs: int = 5                 # Epoch loops allowing associative valleys to organize
-    probe_wgt_decay: float = 1e-3          # Raised to 1e-3 to cleanly curve the loss bowl to a single point
+    probe_epochs: int = 1                 # Epoch loops allowing associative valleys to organize
+    probe_wgt_decay: float = 5e-3          # Raised to 1e-3 to cleanly curve the loss bowl to a single point
 
     # Runtime Logging Cadence
     log_interval: int = 50

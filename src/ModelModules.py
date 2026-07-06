@@ -231,11 +231,12 @@ class ClinicalDecoder:
             diagnoses.append(icd_string)
         return diagnoses
     
-def execute_clinical_audit(targets, probabilities, thresholds=None, min_positive_prevalence: int = 2):
+def execute_clinical_audit(targets, probabilities, thresholds=None, min_positive_prevalence: int = 2, calibrate_per_class: bool = True, silent: bool = False):
     """
-    🎯 CLINICAL AUDIT CORE:
-    Computes a complete suite of ranking, safety, and workflow metrics 
-    across long-tailed clinical target vectors.
+    🎯 CLINICAL AUDIT CORE (MODULAR UPGRADE):
+    Computes a complete suite of ranking, safety, and workflow metrics across long-tailed 
+    clinical target vectors. Supports silent validation executions for rapid early stopping calculations.
+    Now includes Micro-Averaged AUC-ROC calculation.
     """
     num_samples, num_classes = targets.shape
     
@@ -248,28 +249,37 @@ def execute_clinical_audit(targets, probabilities, thresholds=None, min_positive
     
     for c_idx in range(num_classes):
         pos_count = targets[:, c_idx].sum()
-        # Metrics require at least one positive and one negative sample in the slice
         if pos_count >= min_positive_prevalence and pos_count < num_samples:
             active_class_indices.append(c_idx)
-            
-            # AUC-ROC
             auc_roc_list.append(roc_auc_score(targets[:, c_idx], probabilities[:, c_idx]))
-            
-            # AUC-PR (Average Precision calculation via Precision-Recall Integral)
             prec, rec, _ = precision_recall_curve(targets[:, c_idx], probabilities[:, c_idx])
             auc_pr_list.append(auc(rec, prec))
             
     macro_auc_roc = np.mean(auc_roc_list) * 100 if auc_roc_list else 0.0
     macro_auc_pr = np.mean(auc_pr_list) * 100 if auc_pr_list else 0.0
 
+    # 🚀 NEW: Calculate Micro-Averaged AUC-ROC across active target columns
+    if len(active_class_indices) > 0:
+        micro_auc_roc = roc_auc_score(
+            targets[:, active_class_indices], 
+            probabilities[:, active_class_indices], 
+            average='micro'
+        ) * 100
+    else:
+        micro_auc_roc = 0.0
+
+    # High-speed breakout bypass path for early-epoch pretraining validation checks
+    if silent and not calibrate_per_class:
+        return {
+            "macro_auc_roc": macro_auc_roc,
+            "macro_auc_pr": macro_auc_pr,
+            "micro_auc_roc": micro_auc_roc
+        }
+
     # -----------------------------------------------------------------
     # 🎯 TIER 2: HARD DECISION METRICS (Threshold Calibration)
     # -----------------------------------------------------------------
-    # Add an explicit calibration toggle check (defaulting to False for row-wise safety)
-    calibrate_per_class = True 
-    
     if thresholds is None:
-        # Enforce a true, flat global default anchor across all 456 tracks
         flat_global_anchor = 0.15 
         thresholds = np.ones(num_classes) * flat_global_anchor
         
@@ -293,8 +303,6 @@ def execute_clinical_audit(targets, probabilities, thresholds=None, min_positive
     
     for c_idx in range(num_classes):
         preds[:, c_idx] = (probabilities[:, c_idx] > thresholds[c_idx]).astype(float)
-        
-        # Calculate True Positives, False Positives, True Negatives, False Negatives
         y_true = targets[:, c_idx]
         y_pred = preds[:, c_idx]
         
@@ -306,7 +314,7 @@ def execute_clinical_audit(targets, probabilities, thresholds=None, min_positive
         sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
         
-        if c_idx in active_class_indices:  # Only track classes that have active labels in this cohort
+        if c_idx in active_class_indices:
             sensitivity_list.append(sens)
             specificity_list.append(spec)
 
@@ -329,14 +337,10 @@ def execute_clinical_audit(targets, probabilities, thresholds=None, min_positive
     top1_count = 0
     top3_count = 0
     top5_count = 0  
-    
-    # 🛠️ THE FIX: Sort directly by raw probabilities to preserve true intra-patient rankings
     normalized_scores = probabilities 
     
     for i in range(num_samples):
-        # Sort indices by model confidence in descending order
         top_indices = np.argsort(normalized_scores[i])[::-1]
-        
         if targets[i, top_indices[0]] == 1.0:
             top1_count += 1
         if np.any(targets[i, top_indices[:3]] == 1.0):
@@ -346,24 +350,42 @@ def execute_clinical_audit(targets, probabilities, thresholds=None, min_positive
             
     top1_rate = (top1_count / num_samples) * 100
     top3_rate = (top3_count / num_samples) * 100
-    top5_rate = (top5_count / num_samples) * 100  # Calculate Top-5 rate
+    top5_rate = (top5_count / num_samples) * 100
     
+    metrics_summary = {
+        "macro_auc_roc": macro_auc_roc,
+        "micro_auc_roc": micro_auc_roc,
+        "macro_auc_pr": macro_auc_pr,
+        "macro_f1": macro_f1 * 100,
+        "macro_precision": macro_p * 100,
+        "macro_sensitivity": macro_sens,
+        "macro_specificity": macro_spec,
+        "top1_rate": top1_rate,
+        "top3_rate": top3_rate,
+        "top5_rate": top5_rate,
+        "calibrated_thresholds": thresholds
+    }
+
     # -----------------------------------------------------------------
-    # RENDER AUDIT REPORT
+    # RENDER REPORT BANNER
     # -----------------------------------------------------------------
-    print("\n" + "═"*70)
-    print(" 🏥 COMPREHENSIVE CLINICAL MANIFOLD AUDIT REPORT")
-    print("═"*70)
-    print(f" 🩺 [TIER 1: RANKING]   Macro AUC-ROC:          {macro_auc_roc:3.2f}%")
-    print(f" 🩺 [TIER 1: RANKING]   Macro AUC-PR (Sparsity):{macro_auc_pr:3.2f}%")
-    print("-" * 70)
-    print(f" 🛡️ [TIER 2: BOUNDARY]  Calibrated Macro F1:    {macro_f1 * 100:3.2f}%")
-    print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Precision:        {macro_p * 100:3.2f}%")
-    print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Sensitivity (TPR):{macro_sens:3.2f}%")
-    print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Specificity (TNR):{macro_spec:3.2f}%")
-    print("-" * 70)
-    print(f" ⚡ [TIER 3: WORKFLOW]  Top-1 Primary Hit Rate: {top1_rate:3.2f}%")
-    print(f" ⚡ [TIER 3: WORKFLOW]  Top-3 Differential Rate:{top3_rate:3.2f}%")
-    print(f" ⚡ [TIER 3: WORKFLOW]  Top-5 Differential Rate:{top5_rate:3.2f}%")  # Render Top-5
-    print("═"*70 + "\n")
+    if not silent:
+        print("\n" + "═"*70)
+        print(" 🏥 COMPREHENSIVE CLINICAL MANIFOLD AUDIT REPORT")
+        print("═"*70)
+        print(f" 🩺 [TIER 1: RANKING]   Macro AUC-ROC:          {macro_auc_roc:3.2f}%")
+        print(f" 🩺 [TIER 1: RANKING]   Micro AUC-ROC:          {micro_auc_roc:3.2f}%")
+        print(f" 🩺 [TIER 1: RANKING]   Macro AUC-PR (Sparsity):{macro_auc_pr:3.2f}%")
+        print("-" * 70)
+        print(f" 🛡️ [TIER 2: BOUNDARY]  Calibrated Macro F1:    {metrics_summary['macro_f1']:3.2f}%")
+        print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Precision:        {metrics_summary['macro_precision']:3.2f}%")
+        print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Sensitivity (TPR):{macro_sens:3.2f}%")
+        print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Specificity (TNR):{macro_spec:3.2f}%")
+        print("-" * 70)
+        print(f" ⚡ [TIER 3: WORKFLOW]  Top-1 Primary Hit Rate: {top1_rate:3.2f}%")
+        print(f" ⚡ [TIER 3: WORKFLOW]  Top-3 Differential Rate:{top3_rate:3.2f}%")
+        print(f" ⚡ [TIER 3: WORKFLOW]  Top-5 Differential Rate:{top5_rate:3.2f}%")
+        print("═"*70 + "\n")
+        
+    return metrics_summary
     

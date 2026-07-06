@@ -5,8 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader
+from sklearn.metrics import roc_auc_score
 
-from src.TimelineDataset import BVTDFlattenedDataset  # Use the pre-flattened loader
+from src.TimelineDataset import BVTDFlattenedDataset  
 from src.ModelModules import *
 from src.BaseEngine import *
 from config import CardioConfig
@@ -47,9 +48,68 @@ class DualPhaseTrainingEngine(BaseExecutionEngine):
         self.target_projector = VICRegProjector(in_dim=cfg.latent_dim).to(self.device)
         self.linear_probe = self.pipeline.linear_probe
 
+        # 🏥 VALIDATION LIFECYCLE TRACKER HOOK
+        self.val_loader = DataLoader(
+            BVTDFlattenedDataset(cfg.val_csv_path, max_seq_len=cfg.max_sequence_len, max_targets=cfg.max_targets), 
+            batch_size=cfg.batch_size, shuffle=False, num_workers=2, pin_memory=True
+        )
+
+    def execute_validation_pass(self, phase="Pretraining"):
+        """🛡️ READ-ONLY SUB-GRAPH COHORT EVALUATION MATRIX EXTRACTION"""
+        self.context_encoder.eval()
+        self.predictor.eval()
+        self.context_projector.eval()
+        self.target_projector.eval()
+        if phase == "Probe":
+            self.linear_probe.eval()
+
+        all_probs, all_targets = [], []
+        total_val_loss = 0.0
+
+        with torch.no_grad():
+            for batch in self.val_loader:
+                out = self.pipeline.process_batch(batch, self.device, run_teacher=(phase == "Pretraining"))
+                
+                if phase == "Pretraining":
+                    p_c = self.context_projector(out['z_hat_slots'])
+                    p_t = self.target_projector(out['z_t']).detach()
+                    
+                    loss_align = F.smooth_l1_loss(p_c, p_t, beta=0.5)
+                    loss_var = self.compute_variance_loss(p_c) + self.compute_variance_loss(p_t)
+                    loss_cov = self.compute_covariance_loss(p_c) + self.compute_covariance_loss(p_t)
+                    loss_slot_diversity = self.compute_cross_slot_orthogonal_loss(p_c)
+                    
+                    val_loss = (self.cfg.alpha_align * loss_align + 
+                                self.cfg.alpha_var * loss_var + 
+                                self.cfg.alpha_cov * loss_cov + 
+                                self.cfg.alpha_diverse * loss_slot_diversity)
+                    total_val_loss += val_loss.item()
+                else:
+                    logits = self.linear_probe(out['z_hat_slots'])
+                    probs = torch.sigmoid(logits).cpu().numpy()
+                    all_probs.append(probs)
+                    all_targets.append(out['multi_hot_targets'].cpu().numpy())
+
+        if phase == "Pretraining":
+            mean_loss = total_val_loss / len(self.val_loader)
+            print(f"🔍 [VALIDATION AUDIT] Phase 1 │ Unsupervised Representation Loss: {mean_loss:.4f}")
+            return mean_loss
+        else:
+            probs_matrix = np.concatenate(all_probs, axis=0)
+            targets_matrix = np.concatenate(all_targets, axis=0)
+            
+            # 🚀 CLEAN REUSE: Call the audit engine silently to fetch scores for tracking
+            audit_data = execute_clinical_audit(
+                targets_matrix, probs_matrix, 
+                calibrate_per_class=False, silent=True
+            )
+            
+            macro_auc_roc = audit_data["macro_auc_roc"]
+            print(f"🔍 [VALIDATION AUDIT] Phase 2 │ Patient Manifold Macro AUC-ROC: {macro_auc_roc:.2f}%")
+            return macro_auc_roc
+
     def run_phase1_pretraining(self, train_loader):
-        """🔥 HIGH-SPEED SINGLE-PASS PRE-TRAINING ENGINE (DELEGATED LIFE-CYCLE CONTROL)"""
-        print("\n" + "="*80 + "\n🔥 PHASE 1: OPTIMIZING FOUNDATIONAL PHYSIOLOGICAL WORLD MODEL\n" + "="*80)
+        print("\n" + "="*80 + "\n櫨 PHASE 1: OPTIMIZING FOUNDATIONAL PHYSIOLOGICAL WORLD MODEL\n" + "="*80)
         
         phase1_models = [self.context_encoder, self.predictor, self.context_projector, self.target_projector]
         p1_optimizer = torch.optim.AdamW(
@@ -93,20 +153,42 @@ class DualPhaseTrainingEngine(BaseExecutionEngine):
                 for param_s, param_t in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
                     param_t.data = self.cfg.tau * param_t.data + (1.0 - self.cfg.tau) * param_s.data
 
-        # Checkpointing is fully handled by the base execution loop
+        # 🤝 MEMORY ALIGNED PERSISTENCE: Tracked snapshot memory
+        metrics = self.telemetry.setdefault("Pure-SSL JEPA", {"loss": []})
+        early_stop_mem = metrics.setdefault("early_stop_memory", {"best_score": float('inf'), "patience_counter": 0})
+
+        def phase1_epoch_callback(epoch_idx):
+            # Compute the unsupervised representation loss across the validation cohort
+            val_loss = self.execute_validation_pass(phase="Pretraining")
+            
+            # Minimize Self-Supervised Loss to track and checkpoint the best model weights
+            if val_loss < early_stop_mem["best_score"]:
+                early_stop_mem["best_score"] = val_loss
+                print(f"🔥 [CHECKPOINT] New optimal representation baseline discovered. Exporting backbone states...")
+                self._export_checkpoint({
+                    "context_encoder_state": self.context_encoder.state_dict(), 
+                    "predictor_state": self.predictor.state_dict()
+                }, "best_ssl_backbone.pt")
+            else:
+                print(f"ℹ️ Epoch {epoch_idx} complete. Current Val Loss: {val_loss:.4f} | Best Historical Loss: {early_stop_mem['best_score']:.4f}")
+            
+            # 🚀 REMOVED EARLY STOPPING BREAKOUT: Always return False to enforce complete training across full epoch budget
+            return False
+
         self._execute_epoch_loop(
             "Pure-SSL JEPA", phase1_models, p1_optimizer, train_loader, 
             absolute_jepa_closure, self.cfg.pretrain_epochs, p1_scheduler, 
-            after_step=apply_momentum_teacher_update
+            after_step=apply_momentum_teacher_update, after_epoch=phase1_epoch_callback
         )
 
+        #self.pipeline.load_checkpoint("./checkpoints/best_ssl_backbone.pt", strict=False)
+
     def run_phase2_probe_fitting(self, train_loader, load_checkpoint_path=None):
-        """🎯 FROZEN BACKBONE MULTI-LABEL PROBE PASS"""
-        print("\n" + "="*80 + "\n🎯 PHASE 2: EXECUTING HIGH-VELOCITY REPRODUCIBLE BACKPROPAGATION\n" + "="*80)
+        print("\n" + "="*80 + "\n識 PHASE 2: EXECUTING HIGH-VELOCITY REPRODUCIBLE BACKPROPAGATION\n" + "="*80)
         
         if load_checkpoint_path is not None:
             if not os.path.exists(load_checkpoint_path):
-                raise FileNotFoundError(f"❌ Checkpoint missing at: {load_checkpoint_path}")
+                raise FileNotFoundError(f"Checkpoint missing at: {load_checkpoint_path}")
             checkpoint_weights = torch.load(load_checkpoint_path, map_location=self.device)
             self.context_encoder.load_state_dict(checkpoint_weights['context_encoder_state'])
             self.predictor.load_state_dict(checkpoint_weights['predictor_state'])
@@ -146,11 +228,29 @@ class DualPhaseTrainingEngine(BaseExecutionEngine):
             y = out['multi_hot_targets'].float()
             return criterion(logits, y)
 
+        # 🤝 MEMORY ALIGNED PERSISTENCE: Saved inside the telemetry snapshot automatically
+        p2_metrics = self.telemetry.setdefault("ASL Probe-Fitting", {"loss": []})
+        p2_early_stop_mem = p2_metrics.setdefault("early_stop_memory", {"best_score": -float('inf'), "patience_counter": 0})
+
+        def phase2_epoch_callback(epoch_idx):
+            macro_auc = self.execute_validation_pass(phase="Probe")
+            
+            # Maximize Macro AUC-ROC Metrics
+            if macro_auc > p2_early_stop_mem["best_score"]:
+                p2_early_stop_mem["best_score"] = macro_auc
+                p2_early_stop_mem["patience_counter"] = 0
+                self._export_unified_checkpoint()
+            else:
+                p2_early_stop_mem["patience_counter"] += 1
+                print(f"⚠️ [PATIENCE WARNING] Phase 2 has stalled for {p2_early_stop_mem['patience_counter']}/{self.cfg.patience} epochs.")
+                
+            return p2_early_stop_mem["patience_counter"] >= self.cfg.patience
+
         self._execute_epoch_loop(
             "ASL Probe-Fitting", [self.linear_probe], p2_optimizer, 
-            train_loader, phase2_closure, num_epochs=self.cfg.probe_epochs, scheduler=p2_scheduler
+            train_loader, phase2_closure, num_epochs=self.cfg.probe_epochs, scheduler=p2_scheduler,
+            after_epoch=phase2_epoch_callback
         )
-        self._export_unified_checkpoint()
 
     def _export_unified_checkpoint(self):
         os.makedirs(self.cfg.checkpoint_dir, exist_ok=True)
@@ -165,17 +265,14 @@ class DualPhaseTrainingEngine(BaseExecutionEngine):
 if __name__ == "__main__":
     cfg = CardioConfig()
     cfg.train_csv_path = "train_patient_flattened.csv"
+    cfg.patience = 7  # Early Stopping Epoch Threshold Bound Constraint
     
     train_loader = DataLoader(
         BVTDFlattenedDataset(cfg.train_csv_path, max_seq_len=cfg.max_sequence_len, max_targets=cfg.max_targets), 
-        batch_size=cfg.batch_size, 
-        shuffle=True, 
-        drop_last=True,
-        num_workers=4,            # Parallelizes data unpooling on CPU
-        pin_memory=True,          # Locks pages in host memory to accelerate PCIe transfer speeds
-        prefetch_factor=2         # Pre-stages data batches ahead of active calculations
+        batch_size=cfg.batch_size, shuffle=True, drop_last=True, num_workers=4, pin_memory=True
     )
     
     engine = DualPhaseTrainingEngine(cfg)
-    engine.run_phase1_pretraining(train_loader)
-    engine.run_phase2_probe_fitting(train_loader)
+    #engine.run_phase1_pretraining(train_loader)
+    engine.run_phase2_probe_fitting(train_loader, "./checkpoints/unified_jepa_and_probe.pt")
+    engine.dump_telemetry()

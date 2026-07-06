@@ -22,6 +22,53 @@ class ClinicalPipeline:
         ).to(device)
         self.linear_probe = LinearProbeHead(cfg.num_slots, cfg.latent_dim, self.num_icd_classes).to(device)
 
+    def load_checkpoint(self, checkpoint_path, strict=True):
+        """
+        💾 PLUGGABLE ARTIFACT LOADER:
+        Dynamically restores available module parameters based on checkpoint state keys.
+        Supports both standalone SSL backbones and fully unified probe assemblies.
+        """
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"❌ Target checkpoint file missing at: {checkpoint_path}")
+
+        print(f"📥 Loading pipeline components from checkpoint artifact -> {checkpoint_path}")
+        # Enforce device synchronization to prevent VRAM memory mismatches
+        weights = torch.load(checkpoint_path, map_location=self.device)
+        
+        # Track loaded modules for terminal diagnostic visibility
+        loaded_modules = []
+
+        # 🔹 Extract Phase 1/2 Shared Foundation Backbone
+        if 'context_encoder_state' in weights:
+            self.context_encoder.load_state_dict(weights['context_encoder_state'], strict=strict)
+            loaded_modules.append("ContextEncoder")
+            
+        if 'predictor_state' in weights:
+            self.predictor.load_state_dict(weights['predictor_state'], strict=strict)
+            loaded_modules.append("Predictor")
+
+        # 🔹 Extract Target Encoder state (if explicitly saved during training)
+        if 'target_encoder_state' in weights:
+            self.target_encoder.load_state_dict(weights['target_encoder_state'], strict=strict)
+            loaded_modules.append("TargetEncoder")
+        elif 'context_encoder_state' in weights:
+            # Fallback alignment: synchronize the teacher to match the student state if initializing fresh
+            for param_s, param_t in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
+                param_t.data.copy_(param_s.data)
+            loaded_modules.append("TargetEncoder (Synchronized from Context)")
+
+        # 🔹 Extract Phase 2 Linear Probe Head
+        if 'linear_probe_state' in weights:
+            self.linear_probe.load_state_dict(weights['linear_probe_state'], strict=strict)
+            loaded_modules.append("LinearProbeHead")
+
+        print(f"✨ Successfully restored modules: {', '.join(loaded_modules)}")
+        
+        # Switch components to read-only evaluation posture automatically
+        self.context_encoder.eval()
+        self.predictor.eval()
+        self.linear_probe.eval()
+
     def process_batch(self, batch, device, run_teacher=False):
         # Tensors arrive cleanly pre-shaped at [B, T] from the DataLoader channel
         f_ids  = batch['feature_ids'].to(device)
