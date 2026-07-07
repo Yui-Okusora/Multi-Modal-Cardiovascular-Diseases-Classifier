@@ -9,13 +9,13 @@ Instead of relying on standard text summaries or text-extraction shortcuts that 
 ## 🔬 Core Architecture & System Mechanics
 
 ```
-TRAINING PHASE (Pure-SSL JEPA: 5 Epochs)
+PRETRAINING PHASE (Pure-SSL JEPA: 5 Epochs)
 Context Sequence [B, T]  ──> [Context Encoder] ──> Predictor ──> p_c [B, K, 2048]  ──┐
                                                                                      ├──> Multi-Component Regularization (VICReg + Orthogonality)
 Target Future Sequence   ──> [Target Encoder] ─────────────────> p_t [B, K, 2048]  ──┘
                                  ▲ (EMA Updates, τ=0.99)
 
-EVALUATION PHASE (ASL Probe-Fitting: 1 Epoch)
+PROBE TRAINING PHASE (ASL Probe-Fitting: 1 Epoch)
 Terminal History [B, T]  ──> [Context Encoder] ──> Predictor ──> Latent z [B, K, 512] ──> [Linear Probe Head] ──> 456 Multi-Label Targets
 ```
 
