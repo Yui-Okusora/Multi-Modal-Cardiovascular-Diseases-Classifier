@@ -8,6 +8,162 @@ Instead of relying on standard text summaries or text-extraction shortcuts that 
 
 ## 🔬 Core Architecture & System Mechanics
 
+### I. Detailed Neural Network Module Topology Maps
+
+#### 1. ContinuousTimeEmbedding
+Transforms sparse, continuous time intervals into high-dimensional periodic frequency arrays using Random Fourier Features (RFF).
+
+```
+Input Timestamps [B, T]
+      │
+      ▼
+[ Scaled Frequency Matrix Projection ] ────> Multiply by buffered frequency weights
+      │
+      ├──> sin(scaled_t) ──┐
+      │                    └──> torch.cat([sin, cos], dim=-1) -> [B, T, d_model]
+      └──> cos(scaled_t) ──┘
+                           │
+                           ▼
+               [ nn.LayerNorm (time_norm) ]  <── Stabilizer: Limits absolute variance space
+                           │
+                           ▼
+                [ nn.Dropout (time_dropout) ]
+                           │
+                           ▼
+               Output Time Tokens [B, T, d_model]
+```
+
+---
+
+#### 2. UnifiedSystemicTokenizer
+The global frontend router that maps continuous vital measurements, categorical metadata, and timestamps into a shared, regularized coordinate tracking space.
+
+```
+Inputs:  feature_ids [B, T]   numeric_values [B, T]   cat_result_ids [B, T]   timestamps [B, T]
+              │                     │                       │                       │
+              ▼                     ▼                       ▼                       ▼
+      [nn.Embedding]         [nn.Linear]            [nn.Embedding]       [ContinuousTimeEmbedding]
+     (feature_embedding)  (numeric_projection)   (cat_result_embedding)       (time_embedder)
+              │                     │                       │                       │
+              │                     ▼                       │                       │
+              │             [nn.LayerNorm]                  │                       │
+              │             (numeric_norm)                  │                       │
+              │                     │                       │                       │
+              ▼                     ▼                       ▼                       ▼
+       Feat_Tokens           Value_Tokens            Cat_Tokens              Time_Tokens
+       [B,T,d_model]         [B,T,d_model]           [B,T,d_model]           [B,T,d_model]
+              │                     │                       │                       │
+              └─────────────────────┴───────┬───────────────┴───────────────────────┘
+                                            │ (Additive Feature Summation)
+                                            ▼
+                                [ nn.LayerNorm (global_token_norm) ]
+                                            │
+                                            ▼
+                               [ nn.Dropout (global_token_dropout) ]
+                                            │
+                                            ▼
+                                Unified Sequence Tokens [B, T, d_model]
+```
+
+---
+
+#### 3. PerceiverLatentPooling
+Squeezes variable-length timeline trajectories down to a fixed computational bottleneck of $K$ slots while protecting backpropagation lines via a Pre-LN architecture.
+
+```
+Input Sequence [B, T, d_model]               Learned Latent Parameter [K, d_model]
+              │                                             │
+              ▼ (Pre-LN Shield)                             ▼ (Pre-LN Shield)
+   [ nn.LayerNorm (kv_norm) ]                  [ nn.LayerNorm (slot_norm) ]
+              │                                             │
+              │                                             ▼ [Expand to Batch Size]
+              │                                        norm_slots [B, K, d_model]
+              │                                             │
+              │  ┌──────────────────────────────────────────┤
+              │  │ (Value)    (Key)                         │ (Query)
+              ▼  ▼            ▼                             ▼
+        [ nn.MultiheadAttention (cross_attn) with key_padding_mask ]
+                                    │
+                                    ▼
+                               attn_out [B, K, d_model]
+                                    │
+                                    ▼ (Residual Summation: norm_slots + attn_out)
+                        Output Pooled Slots [B, K, d_model]
+```
+
+---
+
+#### 4. ContextEncoder & TargetEncoder
+The core chronological architectures of the JEPA framework. The TargetEncoder serves as the unmasked momentum teacher for the Student ContextEncoder.
+
+```
+Input Sequence Arrays (features, values, categoricals, timestamps, padding_mask)
+      │
+      ▼
+[ UnifiedSystemicTokenizer (tokenizer) ]  ──────> Compiles aligned input embeddings [B, T, d_model]
+      │
+      ▼
+[ nn.TransformerEncoder (temporal_backbone) ] ──> Processes self-attention loops (norm_first=True)
+      │
+      ▼
+[ PerceiverLatentPooling (perceiver_pool) ] ────> Squeezes sequence down to fixed bottleneck [B, K, d_model]
+      │
+      ▼
+[ nn.LayerNorm (output_norm) ] ─────────────────> Stabilizes cross-slot coordinate limits
+      │
+      ▼
+[ torch.nn.functional.normalize (p=2) ] ────────> L2-normalization maps vectors onto a unit sphere
+      │
+      ▼
+Stable Manifold Latent Tensors [B, K, d_model] (z_c / z_t)
+```
+
+---
+
+#### 5. Predictor
+Handles matrix-to-matrix mapping to bridge student contexts over to the target teacher embedding landscape.
+
+```
+Input Student Latents z_c [B, K, d_model]
+      │
+      ├──> [ Channel-Wise MLP (channel_mlp) ] ──> Linear ──> GELU ──> Linear ──> LayerNorm [B, K, d_model]
+      │                                                                                │
+      ▼ (Transpose to [B, d_model, K])                                                 │
+[ Cross-Slot Mixing Layer (slot_combiner) ] <──────────────────────────────────────────┘
+      │
+      ▼ (Transpose back to [B, K, d_model])
+  z_out [B, K, d_model]
+      │
+      ▼ (Residual Summation: z_predicted + z_out)
+[ torch.nn.functional.normalize (p=2) ] ────────> Stabilizer Shield before VICReg loss calculations
+      │
+      ▼
+Predicted Target Embeddings p_c [B, K, d_model]
+```
+
+---
+
+#### 6. LinearProbeHead
+Bypasses seed dependencies by leveraging the strict convexity of single-layer downstream cross-entropy hyperplanes.
+
+```
+Input Slot Latents z_hat_slots [B, K, d_model]
+      │
+      ▼
+[ Tensor View Flattening Pass ] ────────────────> Reshapes matrix to flat 1D sequence [B, K * d_model]
+      │
+      ▼
+   [ nn.Dropout (feature_dropout) ] ────────────> Injects a 40% regularization dropout barrier
+      │
+      ▼
+   [ nn.Linear (classifier) ] ──────────────────> Projects unseeded weights to class counts
+      │
+      ▼
+Output Diagnostic Logits [B, num_classes] (456 Target Classes)
+```
+---
+
+### II. Training Pipeline
 ```
 PRETRAINING PHASE (Pure-SSL JEPA: 5 Epochs)
 Context Sequence [B, T]  ──> [Context Encoder] ──> Predictor ──> p_c [B, K, 2048]  ──┐
