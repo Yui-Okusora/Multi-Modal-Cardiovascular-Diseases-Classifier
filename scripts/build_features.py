@@ -18,7 +18,7 @@ def clean_and_parse_numeric(val_str):
     if pd.isna(val_str):
         return None
     cleaned = str(val_str).strip().replace(',', '.')
-    match = re.search(r"[-+]?\d*\\.\d+|\d+", cleaned)
+    match = re.search(r"[-+]?\d*\.\d+|\d+", cleaned)
     if match:
         return float(match.group())
     return None
@@ -74,6 +74,41 @@ def build_unified_vocabularies(xn_df, cdha_df):
                 
     return feature_codebook, cat_result_vocab
 
+def greedy_multilabel_stratification(patients, patient_labels, train_ratio=0.8):
+    num_patients = len(patients)
+    assignments = np.zeros(num_patients, dtype=int)
+    class_counts = patient_labels.sum(axis=0)
+    sorted_classes = np.argsort(class_counts)
+    
+    target_train = int(num_patients * train_ratio)
+    target_val = num_patients - target_train
+    c_train, c_val = 0, 0
+    
+    for c_idx in sorted_classes:
+        match_pats = np.where((patient_labels[:, c_idx] == 1) & (assignments == 0))[0]
+        if len(match_pats) == 0: continue
+        np.random.shuffle(match_pats)
+        
+        for p_idx in match_pats:
+            if (c_train / max(1, target_train)) <= (c_val / max(1, target_val)):
+                assignments[p_idx] = 1
+                c_train += 1
+            else:
+                assignments[p_idx] = 2
+                c_val += 1
+                
+    unassigned = np.where(assignments == 0)[0]
+    np.random.shuffle(unassigned)
+    for p_idx in unassigned:
+        if c_train < target_train:
+            assignments[p_idx] = 1
+            c_train += 1
+        else:
+            assignments[p_idx] = 2
+            c_val += 1
+            
+    return {patients[i] for i in range(num_patients) if assignments[i] == 1}
+
 if __name__ == "__main__":
     print("=== Launching Offline Dataset Trajectory Unrolling Pipeline ===")
     
@@ -95,19 +130,23 @@ if __name__ == "__main__":
     all_patients = sorted(list(set(cdha_df['mabn']).intersection(set(xn_df['mabn']))))
     mabn_anonymizer = {raw_id: idx for idx, raw_id in enumerate(all_patients, start=1)}
     
+    num_patients = len(all_patients)
+    patient_labels = np.zeros((num_patients, len(icd_codebook)), dtype=np.float32)
+    p_icd_map = cdha_df.groupby('mabn')['maicd'].apply(set).to_dict()
+    
+    for idx, p in enumerate(all_patients):
+        for code in p_icd_map.get(p, set()):
+            if code in icd_codebook:
+                patient_labels[idx, icd_codebook[code]] = 1.0
+                
     np.random.seed(42)
-    np.random.shuffle(all_patients)
-    split = int(len(all_patients) * 0.8)
-    train_mabns = set(all_patients[:split])
+    train_mabns = greedy_multilabel_stratification(all_patients, patient_labels, train_ratio=0.65)
 
     cfg = CardioConfig()
-    
     MAX_SEQ_LEN = cfg.max_sequence_len  
     train_flattened_rows, val_flattened_rows = [], []
     
-    # Telemetry Counter Blocks
     train_patients_scanned, val_patients_scanned = 0, 0
-    
     xn_grouped = xn_df.groupby('mabn', sort=False)
     
     print("⏳ Unrolling patient trajectories into pre-computed step slices...")
@@ -170,7 +209,7 @@ if __name__ == "__main__":
             
             if technique in feature_codebook:
                 f_id = feature_codebook[technique]
-                ef_match = re.search(r"ef\\s*=\\s*(\\d+)", text_summary.lower())
+                ef_match = re.search(r"ef\s*=\s*(\d+)", text_summary.lower())
                 extracted_numeric = float(ef_match.group(1)) if ef_match else 0.0
                 
                 words = clean_and_tokenize_text(text_summary)
@@ -182,35 +221,31 @@ if __name__ == "__main__":
 
         if not raw_interleaved_events: continue
         raw_interleaved_events.sort(key=lambda x: x[0])
-        encounter_base_date = raw_interleaved_events[0][0]
         
-        # Build the dynamic timeline array
-        dynamic_events_pool = []
-        for evt_date, f_id, v_num, c_id in raw_interleaved_events:
-            elapsed_hours = float((evt_date - encounter_base_date).total_seconds() / 3600.0)
-            dynamic_events_pool.append((elapsed_hours, f_id, v_num, c_id))
-            
         encounter_codes = p_cdha['maicd'].unique()
         icd_ids = [icd_codebook[code] for code in encounter_codes if code in icd_codebook]
         if not icd_ids: continue
 
-        # 🚀 STRATEGIC TRAJECTORY PROCESSING BIFURCATION
+        # 🚀 REFACTORED DIRECTIONAL INFRASTRUCTURE PATHS
         if is_train:
-            # 🔹 TRAINING PATH: Unroll completely into sequential step windows for sample augmentation
-            for step_idx in range(1, len(dynamic_events_pool)):
-                active_history = dynamic_events_pool[:step_idx + 1]
+            for step_idx in range(1, len(raw_interleaved_events)):
+                cutoff_date = raw_interleaved_events[step_idx][0]
+                active_history_raw = raw_interleaved_events[:step_idx + 1]
                 
-                if len(active_history) > (MAX_SEQ_LEN - 2):
-                    active_history = active_history[-(MAX_SEQ_LEN - 2):]
+                if len(active_history_raw) > MAX_SEQ_LEN:
+                    active_history_raw = active_history_raw[-MAX_SEQ_LEN:]
                     
-                final_timeline = [
-                    (0.0, feature_codebook['tuoi'], float(normalized_age), 0),
-                    (0.0, feature_codebook['phai'], 0.0, int(gender_cat_id))
-                ] + active_history
+                # ⏳ COMPUTE REVERSED LOOKBACK DURATIONS (Target step acts as 0.0 anchor)
+                final_timeline = []
+                for evt_date, f_id, v_num, c_id in active_history_raw:
+                    lookback_hours = float((cutoff_date - evt_date).total_seconds() / 3600.0)
+                    final_timeline.append((lookback_hours, f_id, v_num, c_id))
                 
                 record = {
                     'mabn': f"patient_{censored_mabn_id}_step_{step_idx}",
-                    'cutoff_idx': step_idx,
+                    'cutoff_idx': len(final_timeline) - 1, # Direct absolute coordinate matching
+                    'age': float(normalized_age),          # Explicit DataFrame extraction
+                    'gender': int(gender_cat_id),          # Explicit DataFrame extraction
                     'timestamps': " ".join([str(e[0]) for e in final_timeline]),
                     'feature_ids': " ".join([str(e[1]) for e in final_timeline]),
                     'numeric_values': " ".join([str(e[2]) for e in final_timeline]),
@@ -219,20 +254,22 @@ if __name__ == "__main__":
                 }
                 train_flattened_rows.append(record)
         else:
-            # 🔸 VALIDATION PATH: DO NOT UNROLL. Extract exclusively the single terminal complete sequence
-            active_history = dynamic_events_pool
-            
-            if len(active_history) > (MAX_SEQ_LEN - 2):
-                active_history = active_history[-(MAX_SEQ_LEN - 2):]
+            cutoff_date = raw_interleaved_events[-1][0]
+            active_history_raw = raw_interleaved_events
+
+            if len(active_history_raw) > MAX_SEQ_LEN:
+                active_history_raw = active_history_raw[-MAX_SEQ_LEN:]
                 
-            final_timeline = [
-                (0.0, feature_codebook['tuoi'], float(normalized_age), 0),
-                (0.0, feature_codebook['phai'], 0.0, int(gender_cat_id))
-            ] + active_history
+            final_timeline = []
+            for evt_date, f_id, v_num, c_id in active_history_raw:
+                lookback_hours = float((cutoff_date - evt_date).total_seconds() / 3600.0)
+                final_timeline.append((lookback_hours, f_id, v_num, c_id))
             
             record = {
                 'mabn': f"patient_{censored_mabn_id}_terminal",
-                'cutoff_idx': len(dynamic_events_pool) - 1,
+                'cutoff_idx': len(final_timeline) - 1,
+                'age': float(normalized_age),
+                'gender': int(gender_cat_id),
                 'timestamps': " ".join([str(e[0]) for e in final_timeline]),
                 'feature_ids': " ".join([str(e[1]) for e in final_timeline]),
                 'numeric_values': " ".join([str(e[2]) for e in final_timeline]),
@@ -241,9 +278,8 @@ if __name__ == "__main__":
             }
             val_flattened_rows.append(record)
 
-    # Export the pre-flattened datasets to disk
-    pd.DataFrame(train_flattened_rows).to_csv("train_patient_flattened.csv", index=False)
-    pd.DataFrame(val_flattened_rows).to_csv("val_patient_flattened.csv", index=False)
+    pd.DataFrame(train_flattened_rows).to_csv(cfg.train_csv_path, index=False)
+    pd.DataFrame(val_flattened_rows).to_csv(cfg.val_csv_path, index=False)
     
     master_codebooks = {
         "metadata": {
@@ -259,12 +295,11 @@ if __name__ == "__main__":
         "inverse_icd_codes": {str(v): k for k, v in icd_codebook.items()}
     }
     
-    with open("clinical_codebooks.json", "w", encoding="utf-8") as f:
+    with open(cfg.codebook_json_path, "w", encoding="utf-8") as f:
         json.dump(master_codebooks, f, indent=4, ensure_ascii=False)
         
-    # 📊 PRINT DETAILED DATASET TELEMETRY REPORT
     print("\n" + "═"*80)
-    print(" 📊 OFFLINE TRAJECTORY UNROLLING COMPILATION REPORT")
+    print(" 📊 OFFLINE STRATIFIED TRAJECTORY UNROLLING COMPILATION REPORT")
     print("═"*80)
     print(f" 📑 TRAINING COHORT CONFIGURATION:")
     print(f"   • Raw Patient Timelines Scanned:      {train_patients_scanned:,} cases")

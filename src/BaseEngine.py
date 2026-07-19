@@ -1,5 +1,6 @@
-# src/BaseEngine.py
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import time
 import os
 import csv
@@ -8,65 +9,98 @@ import math
 class BaseExecutionEngine:
     """
     🎯 CENTRAL RUNTIME ORCHESTRATOR: Highly scalable functional optimization loop.
-    Upgraded with native bfloat16 mixed precision, precision-isolated reduction filters,
-    and granular batch-level state checkpoint recovery loops.
+    Upgraded with toggleable mixed precision configurations, dynamic AMP datatypes,
+    precision-isolated reduction filters, and state checkpoint recovery loops.
     """
     def __init__(self, cfg):
         self.cfg = cfg
         self.device = cfg.device
         self.telemetry = {}
         self.used_tag = []
+        
+        # 🚀 AMP CONTROL MODULE: Dynamically sourced from configuration structures
+        self.use_amp: bool = getattr(cfg, 'use_amp', True)
+        self.amp_dtype: torch.dtype = getattr(cfg, 'amp_dtype', torch.bfloat16)
+        
         # Scaler preserved for structural backward-compatibility if legacy float16 paths are called
-        self.scaler = torch.amp.GradScaler('cuda')
+        self.scaler = torch.amp.GradScaler('cuda', enabled=(self.use_amp and self.amp_dtype == torch.float16))
 
     def _compute_grad_norm(self, parameters):
-        total_norm = 0.0
-        for p in parameters:
-            if p.grad is not None:
-                total_norm += p.grad.detach().data.norm(2).item() ** 2
-        return total_norm ** 0.5
+        return sum(p.grad.detach().data.norm(2).item() ** 2 for p in parameters if p.grad is not None) ** 0.5
     
+    def compute_alignment_loss(self, p_c, p_t, beta: float = 0.5):
+        """
+        🎯 STANDARDIZED SMOOTH L1 ALIGNMENT
+        Standardizes both slot tensors to Mean=0, Std=1 across the feature 
+        dimension prior to computing Smooth L1. Insulates the alignment 
+        penalty from absolute weight-scale drift while preserving outlier robustness.
+        """
+        p_c = p_c.float()
+        p_t = p_t.float()
+        
+        # 🚀 Standardize across the feature/channel dimension (dim=-1)
+        mean_c = p_c.mean(dim=-1, keepdim=True)
+        std_c = p_c.std(dim=-1, keepdim=True) + 1e-6
+        p_c_std = (p_c - mean_c) / std_c
+        
+        mean_t = p_t.mean(dim=-1, keepdim=True)
+        std_t = p_t.std(dim=-1, keepdim=True) + 1e-6
+        p_t_std = (p_t - mean_t) / std_t
+        
+        # Bounded in a standard [Mean=0, Std=1] range. 
+        # beta=0.5 now strictly translates to "transition at 0.5 standard deviations of error."
+        loss_align = F.smooth_l1_loss(p_c_std, p_t_std, beta=beta)
+        return loss_align
+
     def compute_variance_loss(self, z, target_std=1.0, eps=1e-4):
-        # 🛡️ PRECISION GUARD: Force reduction calculations into float32 space
-        z = z.float() 
-        B, K, D = z.size()
-        if B <= 1: 
-            return torch.tensor(0.0, device=z.device)
+        z = z.float()
+        if z.size(0) <= 1: return torch.tensor(0.0, device=z.device)
         std = torch.sqrt(z.var(dim=0) + eps)
         return torch.mean(torch.clamp(target_std - std, min=0.0))
 
     def compute_covariance_loss(self, z):
-        # 🛡️ PRECISION GUARD: Force high-dimensional matrix products into float32 space
         z = z.float()
         B, K, D = z.size()
-        if B <= 1: return torch.tensor(0.0, device=z.device)
-        z_centered = z - z.mean(dim=0, keepdim=True)
-        loss = 0.0
-        diagonal_mask = torch.eye(D, device=z.device)
-        for k in range(K):
-            cov = (z_centered[:, k, :].T @ z_centered[:, k, :]) / (B - 1)
-            loss += torch.log1p((cov * (1.0 - diagonal_mask)) ** 2).sum() / D
-        return loss / K
+        if B <= 1: 
+            return torch.tensor(0.0, device=z.device)
+        
+        # 1. Center features across the batch dimension
+        z_mean = z.mean(dim=0, keepdim=True)
+        z_cent = z - z_mean
+        
+        # 2. Safe scale normalization via clamped standard deviation
+        z_std = torch.sqrt(torch.sum(z_cent ** 2, dim=0, keepdim=True) / (B - 1) + 1e-8)
+        z_std = torch.clamp(z_std, min=1e-2) 
+        z_norm = z_cent / z_std
+        
+        # 3. Parallel Correlation matrix calculation [K, D, D] via BMM
+        corr = torch.bmm(z_norm.permute(1, 2, 0), z_norm.permute(1, 0, 2)) / (B - 1)
+        
+        # 4. Mask out the diagonal elements
+        diagonal_mask = torch.eye(D, device=z.device).unsqueeze(0) # [1, D, D]
+        off_diag_corr = corr * (1.0 - diagonal_mask)
+        
+        # 🚀 THE MATHEMATICAL CORRECTION: Use squared L2 penalty (VICReg Standard)
+        # divided by the exact count of off-diagonal elements.
+        num_off_diagonals = K * D * (D - 1)
+        loss = torch.sum(off_diag_corr ** 2) / num_off_diagonals
+        
+        return loss
     
     def compute_cross_slot_orthogonal_loss(self, z):
-        # 🛡️ PRECISION GUARD: Force normalization and similarity metrics into float32 space
         z = z.float()
         B, K, D = z.size()
         if B <= 1: return torch.tensor(0.0, device=z.device)
         z_norm = torch.nn.functional.normalize(z, p=2, dim=-1)
-        slot_similarity_matrices = torch.bmm(z_norm, z_norm.transpose(1, 2))
-        identity_anchor = torch.eye(K, device=z.device).unsqueeze(0).expand(B, -1, -1)
-        cross_slot_error = (slot_similarity_matrices - identity_anchor) ** 2
-        return cross_slot_error.sum() / (B * K * K)
+        similarity = torch.bmm(z_norm, z_norm.transpose(1, 2))
+        err = (similarity - torch.eye(K, device=z.device).unsqueeze(0).expand(B, -1, -1)) ** 2
+        return err.sum() / (B * K * K)
     
     def create_warmup_cosine_scheduler(self, optimizer, num_warmup_steps: int, num_total_steps: int, min_lr_ratio: float = 0.0):
-        def lr_lambda(current_step: int):
-            if current_step < num_warmup_steps:
-                return float(current_step) / float(max(1, num_warmup_steps))
-            progress = float(current_step - num_warmup_steps) / float(max(1, num_total_steps - num_warmup_steps))
-            progress = min(max(progress, 0.0), 1.0)
-            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+        def lr_lambda(step: int):
+            if step < num_warmup_steps: return float(step) / float(max(1, num_warmup_steps))
+            progress = float(step - num_warmup_steps) / float(max(1, num_total_steps - num_warmup_steps))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     def _execute_epoch_loop(self, tag, models, optimizer, data_loader, loss_fn_lambda, num_epochs=10, scheduler=None, before_step=None, after_step=None, after_epoch=None):
@@ -80,8 +114,9 @@ class BaseExecutionEngine:
         global_step_idx = 0
         accumulated_duration = 0.0
         
-        # Determine target optimization precision configuration profile
-        target_dtype = torch.bfloat16
+        # 🚀 DYNAMIC UPGRADE: Linked precision target profile directly to config variables
+        target_dtype = self.amp_dtype
+        use_scaler = self.use_amp and target_dtype == torch.float16
 
         if os.path.exists(session_file):
             try:
@@ -97,7 +132,7 @@ class BaseExecutionEngine:
                     optimizer.load_state_dict(ckpt['optimizer_state'])
                     if scheduler is not None and ckpt.get('scheduler_state') is not None:
                         scheduler.load_state_dict(ckpt['scheduler_state'])
-                    if ckpt.get('scaler_state') is not None:
+                    if ckpt.get('scaler_state') is not None and use_scaler:
                         self.scaler.load_state_dict(ckpt['scaler_state'])
                         
                     start_epoch = ckpt['epoch']
@@ -128,10 +163,10 @@ class BaseExecutionEngine:
         trainable_params = [p for m in models for p in m.parameters() if p.requires_grad]
         
         print(f"🚀 Initiating High-Order Optimization Pass: [{tag.upper()}] | Budget: {num_epochs} Epochs")
+        print(f"⚙️ Precision Settings: AMP Enabled={self.use_amp} | Target Datatype={target_dtype}")
         loop_start_time = time.perf_counter()
         
         for epoch in range(start_epoch, num_epochs):
-            for m in models: m.train()
             epoch_start = time.perf_counter()
             
             for batch_idx, batch in enumerate(data_loader):
@@ -143,8 +178,8 @@ class BaseExecutionEngine:
                 optimizer.zero_grad()
                 batch_size = batch['feature_ids'].size(0) if 'feature_ids' in batch else self.cfg.batch_size
                 
-                # 🚀 UPGRADE: Swapped out float16 for bfloat16 to eliminate matrix arithmetic limits
-                with torch.amp.autocast('cuda', dtype=target_dtype):
+                # 🚀 UPGRADE: Leveraged 'enabled' attribute to pass config context without nested logic blocks
+                with torch.amp.autocast('cuda', dtype=target_dtype, enabled=self.use_amp):
                     loss_output = loss_fn_lambda(batch, global_step_idx, len(data_loader) * num_epochs)
                     total_loss = 0.0
                     component_logs = []
@@ -165,8 +200,8 @@ class BaseExecutionEngine:
                             if k != "total":
                                 component_logs.append(f"{short_name}:{raw_loss.item():.3f}")
 
-                # Execute target-precision backpropagation routine paths
-                if target_dtype == torch.bfloat16:
+                # 🚀 UPGRADE: Standardized backpropagation to bypass execution scaling if running bfloat16 or standard float32
+                if not use_scaler:
                     total_loss.backward()
                     grad_norm = self._compute_grad_norm(trainable_params)
                     torch.nn.utils.clip_grad_norm_(trainable_params, self.cfg.grad_clip_norm)
@@ -221,7 +256,7 @@ class BaseExecutionEngine:
                         'model_states': [m.state_dict() for m in models],
                         'optimizer_state': optimizer.state_dict(),
                         'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
-                        'scaler_state': self.scaler.state_dict() if target_dtype != torch.bfloat16 else None,
+                        'scaler_state': self.scaler.state_dict() if use_scaler else None,
                         'telemetry_snapshot': metrics,
                         'completed': False
                     }, session_file)
@@ -248,7 +283,7 @@ class BaseExecutionEngine:
                     'model_states': [m.state_dict() for m in models],
                     'optimizer_state': optimizer.state_dict(),
                     'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
-                    'scaler_state': self.scaler.state_dict() if target_dtype != torch.bfloat16 else None,
+                    'scaler_state': self.scaler.state_dict() if use_scaler else None,
                     'telemetry_snapshot': metrics,
                     'completed': True 
                 }, session_file)
@@ -262,7 +297,7 @@ class BaseExecutionEngine:
                 'model_states': [m.state_dict() for m in models],
                 'optimizer_state': optimizer.state_dict(),
                 'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
-                'scaler_state': self.scaler.state_dict() if target_dtype != torch.bfloat16 else None,
+                'scaler_state': self.scaler.state_dict() if use_scaler else None,
                 'telemetry_snapshot': metrics,
                 'completed': (epoch + 1) >= num_epochs
             }, session_file)
