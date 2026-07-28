@@ -1,0 +1,99 @@
+# ==============================================================================
+# 1. PYTHON & ENVIRONMENT ARTIFACTS
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==============================================================================
+# 2. IDE & OS SYSTEM FILES
+# ==============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# VS Code & JetBrains IDE settings
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+*.swp
+*.swo
+
+# ==============================================================================
+# 3. LARGE DATASETS & RAW DATABASE DUMPS
+# ==============================================================================
+# Bare-metal PostgreSQL / SQL database dumps
+*.sql
+
+# Raw and preprocessed CSV/TSV datasets
+*.csv
+*.tsv
+*.parquet
+
+# Explicit project dataset files (if you want to keep small template CSVs tracked later)
+master_cdha_cleaned.csv
+master_xn_cleaned.csv
+train_patient_flattened.csv
+val_patient_flattened.csv
+
+# ==============================================================================
+# 4. MODEL CHECKPOINTS & TRAINED WEIGHTS
+# ==============================================================================
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.safetensors
+
+# ==============================================================================
+# 5. XAI EXPORTS, PLOTS & LOGS
+# ==============================================================================
+exports*./
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+*.log
+
+# Telemetry CSV exports inside checkpoints or root
+telemetry_*.csv
+engine_state_*.pt
+
+*.txt
+
+clinical_codebooks.json
+calibrated_thresholds.json
