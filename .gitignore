@@ -94,6 +94,4 @@ telemetry_*.csv
 engine_state_*.pt
 
 *.txt
-
-clinical_codebooks.json
-calibrated_thresholds.json
+*.json
