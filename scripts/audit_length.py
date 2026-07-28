@@ -1,28 +1,19 @@
-# audit_lengths.py
+# scripts/audit_length.py
+
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
 import pandas as pd
 import numpy as np
-import re
-
-CLINICAL_STOP_WORDS = {
-    'triển', 'khai', 'thí', 'điểm', 'không', 'in', 'phim', 'theo', 'đề', 'án', 'byt',
-    'và', 'các', 'của', 'tại', 'khoa', 'đề_án', 'thí_điểm'
-}
-
-def clean_and_parse_numeric(val_str):
-    if pd.isna(val_str): return None
-    cleaned = str(val_str).strip().replace(',', '.')
-    match = re.search(r"[-+]?\d*\.\d+|\d+", cleaned)
-    return float(match.group()) if match else None
-
-def clean_and_tokenize_text(text_str):
-    if pd.isna(text_str): return []
-    normalized = re.sub(r'[\\/\\\n\t.,;:()\[\]\-#?+*!]', ' ', str(text_str).strip().lower())
-    return [w.strip() for w in normalized.split() if w.strip() and w.strip() not in CLINICAL_STOP_WORDS]
+from config import CardioConfig
+from src.Utils import clean_and_parse_numeric, clean_and_tokenize_text
 
 if __name__ == "__main__":
+    cfg = CardioConfig()
     print("🔍 Loading raw medical databases to trace patient histories...")
-    cdha_df = pd.read_csv("master_cdha_cleaned.csv", dtype=str)
-    xn_df = pd.read_csv("master_xn_cleaned.csv", dtype=str)
+    cdha_df = pd.read_csv(cfg.master_cdha_csv, dtype=str)
+    xn_df = pd.read_csv(cfg.master_xn_csv, dtype=str)
     
     cdha_df['parsed_date'] = pd.to_datetime(cdha_df['mmyy'].astype(str).str.zfill(4), format='%m%y', errors='coerce')
     xn_df['parsed_date'] = pd.to_datetime(xn_df['ddmmyyyy'], errors='coerce', format='mixed')
@@ -39,11 +30,8 @@ if __name__ == "__main__":
     for mabn, p_cdha in cdha_df.groupby('mabn', sort=False):
         if mabn not in xn_grouped.groups: continue
         p_xn = xn_grouped.get_group(mabn)
+        raw_events_count = 2  # [tuoi, phai] header tokens
         
-        # We start at 2 representing the static header tokens: [tuoi, phai]
-        raw_events_count = 2 
-        
-        # 1. Labs and Vitals
         for _, x_row in p_xn.iterrows():
             hp = str(x_row.get('huyetap', ''))
             if '/' in hp:
@@ -54,30 +42,23 @@ if __name__ == "__main__":
                 except ValueError: pass
 
             for f in ['mach', 'nhietdo', 'cannang', 'chieucao']:
-                if clean_and_parse_numeric(x_row.get(f)) is not None:
-                    raw_events_count += 1
+                if clean_and_parse_numeric(x_row.get(f)) is not None: raw_events_count += 1
                     
             lab_name = str(x_row.get('tenxn', '')).strip().lower()
             if lab_name:
                 res_str = str(x_row.get('ketqua', '')).strip().lower()
                 num_parsed = clean_and_parse_numeric(res_str)
-                if num_parsed is not None or res_str:
-                    raw_events_count += 1
+                if num_parsed is not None or res_str: raw_events_count += 1
 
-        # 2. CDHA Reports
         for _, c_row in p_cdha.iterrows():
             tech = str(c_row.get('kythuatcdha', '')).strip().lower()
             if tech:
                 text = str(c_row.get('ketluan', ''))
-                words = clean_and_tokenize_text(text)
-                if words:
-                    raw_events_count += len(words)
-                else:
-                    raw_events_count += 1
+                words = clean_and_tokenize_text(text, stop_words=cfg.clinical_stop_words)
+                raw_events_count += len(words) if words else 1
 
         untruncated_sequence_lengths.append(raw_events_count)
 
-    # Calculate statistics
     lengths = np.array(untruncated_sequence_lengths)
     stats = pd.Series(lengths).describe(percentiles=[0.25, 0.50, 0.75, 0.90, 0.95, 0.99])
     

@@ -35,6 +35,7 @@ class LoRALinearWrapper(nn.Module):
             self.base_layer.weight.add_(weight_delta.to(self.base_layer.weight.device))
         return self.base_layer
 
+
 def defactorize_entire_architecture(module: nn.Module):
     """Recursively scans the graph to merge adapters and restore native nn.Linear layers."""
     for name, child in module.named_children():
@@ -43,6 +44,7 @@ def defactorize_entire_architecture(module: nn.Module):
             setattr(module, name, native_linear)
         else:
             defactorize_entire_architecture(child)
+
 
 def clean_transformer_layer_forward(self, src, src_mask=None, src_key_padding_mask=None, is_causal=False):
     x = src
@@ -54,8 +56,9 @@ def clean_transformer_layer_forward(self, src, src_mask=None, src_key_padding_ma
         x = self.norm2(x + self._ff_block(x))
     return x
 
+
 def inject_lora_infrastructure(module: nn.Module, rank: int = 16, alpha: float = 32.0, target_names=None):
-    """Recursively injects standalone adapters into target layers"""
+    """Recursively injects standalone adapters into target layers."""
     if target_names is None:
         target_names = ["linear1", "linear2", "channel_mlp", "slot_combiner"]
 
@@ -67,8 +70,10 @@ def inject_lora_infrastructure(module: nn.Module, rank: int = 16, alpha: float =
             target_device = child.weight.device
             wrapper = LoRALinearWrapper(child, rank=rank, alpha=alpha).to(target_device)
             
-            if not hasattr(wrapper, "weight"): type(wrapper).weight = property(lambda self: self.base_layer.weight)
-            if not hasattr(wrapper, "bias"): type(wrapper).bias = property(lambda self: self.base_layer.bias)
+            if not hasattr(wrapper, "weight"): 
+                type(wrapper).weight = property(lambda self: self.base_layer.weight)
+            if not hasattr(wrapper, "bias"): 
+                type(wrapper).bias = property(lambda self: self.base_layer.bias)
             setattr(module, name, wrapper)
         else:
             inject_lora_infrastructure(child, rank, alpha, target_names)
