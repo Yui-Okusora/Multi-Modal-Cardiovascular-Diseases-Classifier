@@ -573,12 +573,6 @@ def execute_clinical_audit(
     temp_alpha: float = 0.15,
     silent: bool = False
 ) -> Dict[str, Any]:
-    """
-    DESCRIPTION:
-    ------------
-    Comprehensive multi-tiered evaluation engine for clinical multi-label decision systems.
-    Includes frequency-conditioned temperature scaling for rare-disease logit un-suppression.
-    """
     num_samples, num_classes = targets.shape
 
     if temp_alpha > 0.0:
@@ -602,8 +596,9 @@ def execute_clinical_audit(
             
     macro_auc_roc = np.mean(auc_roc_list) * 100 if auc_roc_list else 0.0
     macro_auc_pr = np.mean(auc_pr_list) * 100 if auc_pr_list else 0.0
+    
     micro_auc_roc = roc_auc_score(
-        targets[:, active_class_indices], probabilities[:, active_class_indices], average='macro'
+        targets[:, active_class_indices], probabilities[:, active_class_indices], average='micro'
     ) * 100 if active_class_indices else 0.0
 
     if silent and not calibrate_per_class and predicted_cardinalities is None:

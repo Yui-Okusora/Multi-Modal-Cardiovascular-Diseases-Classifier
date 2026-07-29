@@ -154,18 +154,20 @@ class ClinicalPipeline:
             if self.probe is None: 
                 self.inject_phase2_infrastructure()
             probe_key = 'probe_state' if 'probe_state' in weights else 'ensemble_probes_state'
-            card_key = 'cardinal_state' if 'cardinal_state' in weights else 'ensemble_cardinals_state'
+            
+            # 🚀 FIXED: Robust key resolution for cardinal head variants
+            card_key = next((k for k in ['cardinal_state', 'ensemble_cardinals_state', 'cardinal_head_state', 'cardinality_head_state'] if k in weights and weights[k] is not None), None)
             
             p_sd = {k.replace("0.", ""): v for k, v in weights[probe_key].items()}
-            c_sd = {k.replace("0.", ""): v for k, v in weights[card_key].items()}
-            
             missing, unexpected = self.probe.load_state_dict(p_sd, strict=False)
             if missing:
                 print(f"⚠️ [PROBE WARNING] Unloaded missing parameters: {missing}")
             if unexpected:
                 print(f"⚠️ [PROBE WARNING] Unexpected parameters skipped: {unexpected}")
 
-            self.cardinal.load_state_dict(c_sd, strict=False)
+            if card_key:
+                c_sd = {k.replace("0.", ""): v for k, v in weights[card_key].items()}
+                self.cardinal.load_state_dict(c_sd, strict=False)
 
         del weights
         gc.collect()
