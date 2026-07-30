@@ -121,53 +121,28 @@ class ClinicalPipeline:
 
     def load_checkpoint(self, checkpoint_path: str, strict: bool = True):
         if not os.path.exists(checkpoint_path): 
-            raise FileNotFoundError(f"❌ Missing artifact at: {checkpoint_path}")
+            raise FileNotFoundError(f"Missing artifact at: {checkpoint_path}")
             
         print(f"📥 Loading components from unified artifact -> {checkpoint_path}")
         weights = torch.load(checkpoint_path, map_location='cpu')
 
+        # 1. Base Backbone Components
         if 'context_encoder_state' in weights:
-            target_state = weights['context_encoder_state']
-            current_state = self.context_encoder.state_dict()
-            adjusted_state = {}
-            has_lora_keys = any('lora_' in k for k in target_state.keys())
-            
-            for k, v in target_state.items():
-                if not has_lora_keys and (k.endswith('.weight') or k.endswith('.bias')) and '.base_layer.' not in k:
-                    wrapper_key = k.replace('.weight', '.base_layer.weight').replace('.bias', '.base_layer.bias')
-                    if wrapper_key in current_state:
-                        adjusted_state[wrapper_key] = v
-                        continue
-                adjusted_state[k] = v
-            self.context_encoder.load_state_dict(adjusted_state, strict=strict if not has_lora_keys else False)
-
-        if 'predictor_state' in weights and getattr(self, 'predictor', None) is not None: 
-            self.predictor.load_state_dict(weights['predictor_state'], strict=strict)
-            
+            self.context_encoder.load_state_dict(weights['context_encoder_state'], strict=False)
         if 'assembler_state' in weights: 
             self.assembler.load_state_dict(weights['assembler_state'], strict=strict)
-            
-        if 'target_encoder_state' in weights and getattr(self, 'target_encoder', None) is not None: 
-            self.target_encoder.load_state_dict(weights['target_encoder_state'], strict=strict)
 
-        if 'probe_state' in weights or 'ensemble_probes_state' in weights:
+        # 2. Hardcoded Phase 2 Heads
+        if weights.get('probe_state') is not None:
             if self.probe is None: 
                 self.inject_phase2_infrastructure()
-            probe_key = 'probe_state' if 'probe_state' in weights else 'ensemble_probes_state'
-            
-            # 🚀 FIXED: Robust key resolution for cardinal head variants
-            card_key = next((k for k in ['cardinal_state', 'ensemble_cardinals_state', 'cardinal_head_state', 'cardinality_head_state'] if k in weights and weights[k] is not None), None)
-            
-            p_sd = {k.replace("0.", ""): v for k, v in weights[probe_key].items()}
-            missing, unexpected = self.probe.load_state_dict(p_sd, strict=False)
-            if missing:
-                print(f"⚠️ [PROBE WARNING] Unloaded missing parameters: {missing}")
-            if unexpected:
-                print(f"⚠️ [PROBE WARNING] Unexpected parameters skipped: {unexpected}")
+            self.probe.load_state_dict(weights['probe_state'], strict=strict)
 
-            if card_key:
-                c_sd = {k.replace("0.", ""): v for k, v in weights[card_key].items()}
-                self.cardinal.load_state_dict(c_sd, strict=False)
+        if weights.get('cardinal_state') is not None:
+            if self.cardinal is None:
+                self.inject_phase2_infrastructure()
+            self.cardinal.load_state_dict(weights['cardinal_state'], strict=strict)
+            print("✨ [CARDINAL HEAD] Successfully restored trained weights!")
 
         del weights
         gc.collect()
@@ -175,12 +150,14 @@ class ClinicalPipeline:
     def process_batch(self, batch: Dict[str, Any], device: torch.device, run_teacher: bool = False) -> Dict[str, Any]:
         B = batch['feature_ids'].size(0)
 
+        active_padding_mask = batch['student_mask'].to(device) if run_teacher else batch['base_mask'].to(device)
+
         z_c_raw = self.context_encoder(
             feature_ids=batch['feature_ids'].to(device), 
             numeric_values=batch['numeric_values'].to(device), 
             cat_result_ids=batch['cat_result_ids'].to(device), 
             timestamps=batch['timestamps'].to(device), 
-            padding_mask=batch['student_mask'].to(device)
+            padding_mask=active_padding_mask
         )
 
         if run_teacher:

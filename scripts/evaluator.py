@@ -1,5 +1,4 @@
 # scripts/evaluator.py
-
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -165,9 +164,10 @@ class CleanReadonlyEvaluator:
         
         self.val_loader = DataLoader(
             BVTDFlattenedDataset(
-                cfg.val_csv_path, 
+                preprocessed_csv_path=cfg.val_csv_path, 
                 max_seq_len=cfg.max_sequence_len, 
-                max_targets=cfg.max_targets,
+                max_subwords=cfg.max_subwords,  # 🚀 FIXED: Explicit keyword argument
+                max_targets=cfg.max_targets,    # 🚀 FIXED: Explicit keyword argument
                 is_train=False
             ), 
             batch_size=cfg.batch_size, 
@@ -194,22 +194,19 @@ class CleanReadonlyEvaluator:
 
         pipeline = ClinicalPipeline(self.cfg, self.device)
         pipeline.load_checkpoint(checkpoint_path)
-        
-        # Restore cardinal head parameters if present under legacy keys
-        weights = torch.load(checkpoint_path, map_location=self.device)
-        for key in ['cardinal_state', 'ensemble_cardinals_state', 'cardinal_head_state']:
-            if key in weights and weights[key] is not None:
-                sd = {k.replace("0.", ""): v for k, v in weights[key].items()}
-                if pipeline.cardinal is None:
-                    pipeline.inject_phase2_infrastructure()
-                pipeline.cardinal.load_state_dict(sd, strict=False)
-                break
                 
         pipeline.context_encoder.eval()
         if pipeline.probe is not None: pipeline.probe.eval()
         if pipeline.cardinal is not None: pipeline.cardinal.eval()
         
         probs, targets, pred_cards = extract_probe_predictions(pipeline, self.val_loader, self.device)
+
+        # 🚀 CARDINALITY DIAGNOSTIC AUDIT
+        rounded_k = np.maximum(1, np.round(pred_cards.squeeze()))
+        unique_k, k_counts = np.unique(rounded_k, return_counts=True)
+        dist_str = ", ".join([f"K={int(k)}: {c}" for k, c in zip(unique_k, k_counts)])
+        print(f"\n📊 [CARDINALITY AUDIT] Mean Pred K: {pred_cards.mean():.2f} (Min: {pred_cards.min():.2f}, Max: {pred_cards.max():.2f})")
+        print(f"   ↳ Dynamic K Distribution: [{dist_str}]")
         
         print(f"\n📊 Running Baseline Audit (Fixed Anchor tau = {self.cfg.eval_flat_threshold} with Auxiliary Cardinality)...")
         flat_thresholds = np.ones(pipeline.num_icd_classes) * self.cfg.eval_flat_threshold

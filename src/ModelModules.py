@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, precision_recall_fscore_support
 from typing import Tuple, Dict, Any, List, Optional, Union
 
@@ -79,43 +80,78 @@ class PeriodicNumericalEmbedding(nn.Module):
         return self.mlp(fourier_feat)
 
 
+class LocalFactorizedTextEncoder(nn.Module):
+    def __init__(self, vocab_size: int = 1500, d_model: int = 512, bottleneck_dim: int = 64):
+        super().__init__()
+        self.subword_embed = nn.Embedding(vocab_size, bottleneck_dim, padding_idx=0)
+        self.projection = nn.Linear(bottleneck_dim, d_model)
+        self.attn_query = nn.Linear(d_model, 1, bias=False)
+        self.layer_norm = nn.LayerNorm(d_model)
+
+    def _pool_impl(self, embs: torch.Tensor, flat_ids: torch.Tensor) -> torch.Tensor:
+        attn_logits = self.attn_query(embs)
+        
+        pad_mask = (flat_ids == 0).unsqueeze(-1)
+        all_padded = pad_mask.all(dim=1, keepdim=True)
+        pad_mask = pad_mask.masked_fill(all_padded, False)
+        
+        attn_logits = attn_logits.masked_fill(pad_mask, -1e9)
+        attn_weights = F.softmax(attn_logits, dim=1)
+        
+        pooled_text = torch.sum(embs * attn_weights, dim=1)
+        return self.layer_norm(pooled_text)
+
+    def forward(self, cat_result_ids: torch.Tensor) -> torch.Tensor:
+        B, L_seq, L_text = cat_result_ids.shape
+        flat_ids = cat_result_ids.view(B * L_seq, L_text)
+        
+        embs = self.projection(self.subword_embed(flat_ids))  # [B*L_seq, 16, 512]
+        
+        if self.training and embs.requires_grad:
+            pooled = checkpoint(self._pool_impl, embs, flat_ids, use_reentrant=False)
+        else:
+            pooled = self._pool_impl(embs, flat_ids)
+            
+        return pooled.view(B, L_seq, -1)
+
 # ==================================================================================================
 # 2. UNIFIED SYSTEMIC TOKENIZER
 # ==================================================================================================
-class UnifiedSystemicTokenizer(nn.Module):
-    """
-    DESCRIPTION:
-    ------------
-    Hybrid UnifiedSystemicTokenizer combining High-Rank Periodic Fourier numeric 
-    encoding with Feature-wise Linear Modulation (FiLM) conditioned on clinical concept IDs.
-    """
-    def __init__(self, num_total_features: int, num_cat_results: int, d_model: int = 512, num_frequencies: int = 32):
+class UnifiedSystemicEmbedder(nn.Module):
+    def __init__(self, num_total_features: int, bpe_vocab_size: int = 1500, d_model: int = 512, num_frequencies: int = 32):
         super().__init__()
         self.feature_embedding = nn.Embedding(num_total_features, d_model)
         self.numeric_encoder = PeriodicNumericalEmbedding(d_model=d_model, num_frequencies=num_frequencies)
         self.film_gamma = nn.Linear(d_model, d_model)
-        self.cat_result_embedding = nn.Embedding(num_cat_results, d_model, padding_idx=0)
+        
+        self.text_encoder = LocalFactorizedTextEncoder(vocab_size=bpe_vocab_size, d_model=d_model, bottleneck_dim=64)
+        
         self.time_embedder = ContinuousTimeEmbedding(d_model)
         self.global_token_norm = nn.LayerNorm(d_model)
 
     def forward(
         self, 
-        feature_ids: torch.Tensor, 
-        numeric_values: torch.Tensor, 
-        cat_result_ids: torch.Tensor, 
-        timestamps: torch.Tensor
+        feature_ids: torch.Tensor,       # [B, L_seq]
+        numeric_values: torch.Tensor,    # [B, L_seq]
+        cat_result_ids: torch.Tensor,    # [B, L_seq, 16] (3D Tensor)
+        timestamps: torch.Tensor         # [B, L_seq]
     ) -> torch.Tensor:
         feat_emb = self.feature_embedding(feature_ids)
-        cat_emb  = self.cat_result_embedding(cat_result_ids)
         time_emb = self.time_embedder(timestamps)
         
-        num_emb  = self.numeric_encoder(numeric_values)
+        # 1. Process continuous numeric features with FiLM
+        num_emb = self.numeric_encoder(numeric_values)
         gamma = torch.sigmoid(self.film_gamma(feat_emb))
         modulated_num_emb = gamma * num_emb
         
-        has_numeric_mask = (cat_result_ids == 0).unsqueeze(-1).float()
+        # Mask numeric embedding if event has text (checks if first subword != 0)
+        has_numeric_mask = (cat_result_ids[:, :, 0] == 0).unsqueeze(-1).float()
         modulated_num_emb = modulated_num_emb * has_numeric_mask
         
+        # 2. Local Factorized BPE Attention Pooling -> [B, L_seq, 512]
+        cat_emb = self.text_encoder(cat_result_ids)
+        
+        # 3. Positionally Locked Addition across all 4 streams
         combined_tokens = feat_emb + modulated_num_emb + cat_emb + time_emb
         return self.global_token_norm(combined_tokens)
 
@@ -207,7 +243,7 @@ class ContextEncoder(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
-        self.tokenizer = UnifiedSystemicTokenizer(num_total_features, num_cat_results, d_model)
+        self.tokenizer = UnifiedSystemicEmbedder(num_total_features, num_cat_results, d_model)
         
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=8, dim_feedforward=d_model * 4, 
@@ -240,13 +276,7 @@ TargetEncoder = ContextEncoder
 # 5. WORLD-MODEL PREDICTOR
 # ==================================================================================================
 class Predictor(nn.Module):
-    r"""
-    DESCRIPTION:
-    ------------
-    The world-model transition function in the JEPA architecture. Maps current student latent slots 
-    to predicted future target representations.
-    """
-    def __init__(self, num_slots: int = 24, d_model: int = 512, nhead: int = 8):
+    def __init__(self, num_slots: int = 24, d_model: int = 512, nhead: int = 8, num_layers: int = 3):
         super().__init__()
         self.channel_mlp = nn.Sequential(
             nn.Linear(d_model, d_model * 2),
@@ -254,10 +284,12 @@ class Predictor(nn.Module):
             nn.Linear(d_model * 2, d_model),
             nn.LayerNorm(d_model)
         )
-        self.slot_mixer = nn.TransformerEncoderLayer(
+        # 🚀 Deeper predictor (3 layers) prevents backbone over-specialization
+        predictor_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=d_model * 2,
-            dropout=0.0, activation=F.gelu, batch_first=True, norm_first=True
+            dropout=0.10, activation=F.gelu, batch_first=True, norm_first=True
         )
+        self.slot_mixer = nn.TransformerEncoder(predictor_layer, num_layers=num_layers)
         self.final_norm = nn.LayerNorm(d_model)
 
     def forward(self, z_c: torch.Tensor) -> torch.Tensor:
@@ -279,7 +311,8 @@ class PatientManifoldAssembler(nn.Module):
     def __init__(self, num_cat_results: int, latent_dim: int = 512, covariate_scale: float = 0.50):
         super().__init__()
         self.latent_dim = latent_dim
-        self.covariate_scale = covariate_scale
+
+        self.raw_covariate_scale = nn.Parameter(torch.tensor(0.0))
         
         self.age_projector = nn.Linear(in_features=1, out_features=latent_dim)
         self.gender_embed = nn.Embedding(num_embeddings=num_cat_results, embedding_dim=latent_dim)
@@ -287,13 +320,20 @@ class PatientManifoldAssembler(nn.Module):
         self.age_norm = nn.LayerNorm(latent_dim)
         self.gender_norm = nn.LayerNorm(latent_dim)
 
+    @property
+    def covariate_scale(self) -> torch.Tensor:
+        # 🛡️ Bounded safely in (0.0, 1.0)
+        return torch.sigmoid(self.raw_covariate_scale)
+
     def forward(self, z_c_raw: torch.Tensor, age: torch.Tensor, gender: torch.Tensor) -> torch.Tensor:
         z_age = self.age_norm(self.age_projector(age.unsqueeze(-1))).unsqueeze(1)
         z_gender = self.gender_norm(self.gender_embed(gender)).unsqueeze(1)
         
         scale = math.sqrt(self.latent_dim)
-        z_age = F.normalize(z_age, p=2, dim=-1) * (scale * self.covariate_scale)
-        z_gender = F.normalize(z_gender, p=2, dim=-1) * (scale * self.covariate_scale)
+        c_scale = self.covariate_scale  # Dynamic learnable scaler
+        
+        z_age = F.normalize(z_age, p=2, dim=-1) * (scale * c_scale)
+        z_gender = F.normalize(z_gender, p=2, dim=-1) * (scale * c_scale)
         
         return torch.cat([z_c_raw, z_age, z_gender], dim=1)
 
@@ -438,7 +478,12 @@ class AuxiliaryCardinalityHead(nn.Module):
         attn_logits = self.attention_pool(h_slots) 
         attn_weights = F.softmax(attn_logits, dim=1) 
         pooled_context = torch.sum(h_slots * attn_weights, dim=1)
-        return self.output_projector(pooled_context).squeeze(-1)
+        
+        # 1. Linear projection from pooled slot context
+        raw_score = self.output_projector(pooled_context).squeeze(-1)
+        
+        # 2. Smooth physical floor: Guarantees output K >= 1.0 with non-zero gradients everywhere
+        return 1.0 + F.softplus(raw_score)
 
 
 # ==================================================================================================
@@ -479,25 +524,71 @@ class ClassAwareASL(nn.Module):
     ):
         super().__init__()
         self.gamma_pos = gamma_pos
+        self.gamma_neg_base = gamma_neg_base
+        self.beta_neg_base = beta_neg_base
+        self.delta_beta = delta_beta
         
         if not isinstance(class_frequencies, torch.Tensor):
             class_frequencies = torch.tensor(class_frequencies, dtype=torch.float32)
         else:
             class_frequencies = class_frequencies.float()
             
-        self.register_buffer('gamma_neg', gamma_neg_base + (1.0 - class_frequencies) * 2.0)
-        self.register_buffer('beta_neg', beta_neg_base + delta_beta * (1.0 - class_frequencies))
-        
+        # Registered as buffer so it moves to CUDA automatically with the module
+        self.register_buffer("class_frequencies", class_frequencies)
+
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         probs = torch.sigmoid(logits).float()
         targets = targets.float()
         
-        loss_pos = targets * torch.log(probs + 1e-7) * (1.0 - probs).pow(self.gamma_pos)
-        loss_neg = (1.0 - targets) * torch.log(1.0 - probs + 1e-7) * probs.pow(self.gamma_neg)
+        # Class-aware exponents calculated strictly from fixed constants and static frequencies
+        gamma_neg = self.gamma_neg_base + (1.0 - self.class_frequencies) * 2.0
+        beta_neg = self.beta_neg_base + self.delta_beta * (1.0 - self.class_frequencies)
         
-        batch_loss = - (loss_pos + (self.beta_neg * loss_neg))
+        loss_pos = targets * torch.log(probs + 1e-7) * (1.0 - probs).pow(self.gamma_pos)
+        loss_neg = (1.0 - targets) * torch.log(1.0 - probs + 1e-7) * probs.pow(gamma_neg)
+        
+        batch_loss = - (loss_pos + (beta_neg * loss_neg))
         return batch_loss.sum(dim=-1).mean()
 
+class KendallMultiTaskLoss(nn.Module):
+    """
+    🎯 KENDALL MULTI-TASK UNCERTAINTY LOSS WRAPPER
+    Seamlessly integrates homoscedastic uncertainty weighting into BaseExecutionEngine
+    by receiving and returning a dictionary of [weight, raw_loss] pairs.
+    """
+    def __init__(self, task_keys: list = None, init_log_var: float = 0.0):
+        super().__init__()
+        self.log_vars = nn.ParameterDict()
+        if task_keys is not None:
+            for key in task_keys:
+                self.log_vars[key] = nn.Parameter(torch.tensor(init_log_var, dtype=torch.float32))
+
+    def forward(self, loss_dict: dict) -> dict:
+        out_dict = {}
+        barrier_penalty = 0.0
+
+        for key, val in loss_dict.items():
+            base_weight, raw_loss = val if isinstance(val, (list, tuple)) else (1.0, val)
+            
+            # Dynamic fallback registration if key was not pre-registered in __init__
+            if key not in self.log_vars:
+                dev = raw_loss.device if torch.is_tensor(raw_loss) else torch.device("cpu")
+                self.log_vars[key] = nn.Parameter(torch.tensor(0.0, device=dev, dtype=torch.float32))
+
+            log_var = self.log_vars[key]
+            
+            # Kendall Precision Weight: 0.5 * exp(-log_var)
+            precision = 0.5 * torch.exp(-log_var)
+            effective_weight = precision * (base_weight if base_weight is not None else 1.0)
+            
+            out_dict[key] = [effective_weight, raw_loss]
+            
+            # Accumulate homoscedastic barrier penalty: 0.5 * log_var
+            barrier_penalty = barrier_penalty + (0.5 * log_var)
+
+        # Added as a component so BaseExecutionEngine automatically sums it into total_loss
+        out_dict["loss_kendall_barrier"] = [1.0, barrier_penalty]
+        return out_dict
 
 # ==================================================================================================
 # 12. SPECTRAL MANIFOLD DIAGNOSTICS ENGINE
@@ -563,6 +654,64 @@ def compute_comprehensive_manifold_diagnostics(z: torch.Tensor) -> Dict[str, flo
 # ==================================================================================================
 # 13. DYNAMIC CLINICAL AUDIT ENGINE
 # ==================================================================================================
+def print_clinical_audit_report(
+    metrics_summary: Dict[str, Any], 
+    temp_alpha: float = 0.15, 
+    calibration_beta: float = 1.0
+) -> None:
+    """
+    Renders a formatted, comprehensive clinical audit scorecard strictly using values from metrics_summary.
+    """
+    print("\n" + "═"*75)
+    print(" 🏥 COMPREHENSIVE CLINICAL MANIFOLD AUDIT REPORT")
+    print("═"*75)
+    
+    if temp_alpha > 0.0:
+        print(f" 🧪 [CALIBRATION] Temperature Scaling Active (alpha = {temp_alpha}) | Calibration Beta = {calibration_beta}")
+        print("-" * 75)
+        
+    print(f" 🩺 [TIER 1: RANKING]   Macro AUC-ROC:          {metrics_summary.get('macro_auc_roc', 0.0):3.2f}%")
+    print(f" 🩺 [TIER 1: RANKING]   Micro AUC-ROC:          {metrics_summary.get('micro_auc_roc', 0.0):3.2f}%")
+    print(f" 🩺 [TIER 1: RANKING]   Macro AUC-PR (Sparsity):{metrics_summary.get('macro_auc_pr', 0.0):3.2f}%")
+    print("-" * 75)
+    
+    print(f" 🛡️ [TIER 2: BOUNDARY - GLOBAL MICRO METRICS]")
+    print(f"    • Micro F1 Score:           {metrics_summary.get('micro_f1', 0.0):3.2f}%")
+    print(f"    • Micro Precision:          {metrics_summary.get('micro_precision', 0.0):3.2f}%")
+    print(f"    • Micro Sensitivity (Recall):{metrics_summary.get('micro_sensitivity', 0.0):3.2f}%")
+    print("-" * 75)
+    
+    print(f" 🛡️ [TIER 2: BOUNDARY - UNWEIGHTED MACRO]")
+    print(f"    • Unweighted Macro F1:      {metrics_summary.get('macro_f1', 0.0):3.2f}%")
+    print(f"    • Unweighted Macro Precision: {metrics_summary.get('macro_precision', 0.0):3.2f}%")
+    print(f"    • Unweighted Sensitivity:   {metrics_summary.get('macro_sensitivity', 0.0):3.2f}%")
+    print(f"    • Unweighted Specificity:   {metrics_summary.get('macro_specificity', 0.0):3.2f}%")
+    print("-" * 75)
+    
+    print(f" 📊 [TIER 2: PREVALENCE-WEIGHTED MACRO]")
+    print(f"    • Weighted Macro F1:        {metrics_summary.get('weighted_macro_f1', 0.0):3.2f}%")
+    print(f"    • Weighted Macro Precision: {metrics_summary.get('weighted_macro_precision', 0.0):3.2f}%")
+    print(f"    • Weighted Sensitivity:     {metrics_summary.get('weighted_macro_sensitivity', 0.0):3.2f}%")
+    print(f"    • Weighted Specificity:     {metrics_summary.get('weighted_macro_specificity', 0.0):3.2f}%")
+    print("-" * 75)
+    
+    print(f" 🩺 [TIER 2: TOP-50 FREQUENT DISEASES BENCHMARK]")
+    print(f"    • Top-50 Macro F1:          {metrics_summary.get('top50_macro_f1', 0.0):3.2f}%")
+    print(f"    • Top-50 Precision:         {metrics_summary.get('top50_macro_precision', 0.0):3.2f}%")
+    print(f"    • Top-50 Sensitivity:       {metrics_summary.get('top50_macro_sensitivity', 0.0):3.2f}%")
+    print(f"    • Top-50 Specificity:       {metrics_summary.get('top50_macro_specificity', 0.0):3.2f}%")
+    print("-" * 75)
+    
+    print(f" 🚀 [ADAPTIVE HORIZON]  Hit Rate (Safety Net):  {metrics_summary.get('adaptive_hit_rate', 0.0):3.2f}%")
+    print(f" 🚀 [ADAPTIVE HORIZON]  Precision (Density):    {metrics_summary.get('adaptive_precision', 0.0):3.2f}%")
+    print("═"*75 + "\n")
+    
+    print(f" ⚡ [TIER 3: FIXED K]   Top-1 Primary Hit Rate: {metrics_summary.get('top1_rate', 0.0):3.2f}% │ Precision@1: {metrics_summary.get('precision_at_1', 0.0):3.2f}%")
+    print(f" ⚡ [TIER 3: FIXED K]   Top-3 Differential Rate:{metrics_summary.get('top3_rate', 0.0):3.2f}% │ Precision@3: {metrics_summary.get('precision_at_3', 0.0):3.2f}%")
+    print(f" ⚡ [TIER 3: FIXED K]   Top-5 Differential Rate:{metrics_summary.get('top5_rate', 0.0):3.2f}% │ Precision@5: {metrics_summary.get('precision_at_5', 0.0):3.2f}%")
+    print(f" ⚡ [TIER 3: FIXED K]   Top-8 Differential Rate:{metrics_summary.get('top8_rate', 0.0):3.2f}% │ Precision@8: {metrics_summary.get('precision_at_8', 0.0):3.2f}%")
+    print("═"*75 + "\n")
+
 def execute_clinical_audit(
     targets: np.ndarray, 
     probabilities: np.ndarray, 
@@ -570,11 +719,13 @@ def execute_clinical_audit(
     thresholds: Optional[np.ndarray] = None, 
     min_positive_prevalence: int = 2, 
     calibrate_per_class: bool = True, 
+    calibration_beta: float = 1.0,  # 🚀 Added: beta > 1.0 (e.g., 2.0) prioritizes Recall > 60%
     temp_alpha: float = 0.15,
     silent: bool = False
 ) -> Dict[str, Any]:
     num_samples, num_classes = targets.shape
 
+    # 1. Temperature Scaling Calibration (Frequency-Aware)
     if temp_alpha > 0.0:
         f_c = targets.sum(axis=0)
         max_f = np.max(f_c)
@@ -585,6 +736,7 @@ def execute_clinical_audit(
         scaled_logits = raw_logits / T_c
         probabilities = 1.0 / (1.0 + np.exp(-scaled_logits))
 
+    # 2. Ranking Metrics Calculation (ROC-AUC & PR-AUC)
     auc_roc_list, auc_pr_list, active_class_indices = [], [], []
     for c_idx in range(num_classes):
         pos_count = targets[:, c_idx].sum()
@@ -604,36 +756,35 @@ def execute_clinical_audit(
     if silent and not calibrate_per_class and predicted_cardinalities is None:
         return {"macro_auc_roc": macro_auc_roc, "macro_auc_pr": macro_auc_pr, "micro_auc_roc": micro_auc_roc}
 
+    # 3. Direct Per-Class F_beta Threshold Calibration
     if thresholds is None:
         thresholds = np.ones(num_classes) * 0.15
         if calibrate_per_class:
             for c_idx in active_class_indices:
-                best_score, best_thresh = -1.0, 0.50
                 y_true = targets[:, c_idx]
-                for thresh in np.linspace(0.0001, 0.99, 200):
-                    class_preds = (probabilities[:, c_idx] > thresh).astype(float)
-                    tp = np.sum((y_true == 1) & (class_preds == 1))
-                    fp = np.sum((y_true == 0) & (class_preds == 1))
-                    tn = np.sum((y_true == 0) & (class_preds == 0))
-                    fn = np.sum((y_true == 1) & (class_preds == 0))
-                    
-                    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-                    sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-                    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-                    
-                    if sens >= 0.85 and prec >= 0.85 and spec >= 0.95:
-                        score = 100.0 + (sens + prec + spec) - np.var([sens, prec, spec])
-                    elif spec >= 0.990 and sens >= 0.70:
-                        score = 50.0 + (sens * 2.0) + prec
-                    else:
-                        score = max(0.0, sens + spec - 1.0) * (prec + 1e-5)
-                        
-                    if score > best_score:
-                        best_score, best_thresh = score, thresh
-                thresholds[c_idx] = best_thresh
+                y_prob = probabilities[:, c_idx]
+                
+                if np.sum(y_true) == 0:
+                    thresholds[c_idx] = 0.50
+                    continue
+
+                precisions, recalls, thresh_grid = precision_recall_curve(y_true, y_prob)
+                
+                # 🚀 F_beta calculation (calibration_beta = 2.0 optimizes for Recall > 60%)
+                beta_sq = calibration_beta ** 2
+                fbeta_scores = (1 + beta_sq) * (precisions * recalls) / ((beta_sq * precisions) + recalls + 1e-8)
+                
+                best_idx = np.argmax(fbeta_scores)
+                if best_idx < len(thresh_grid):
+                    thresholds[c_idx] = thresh_grid[best_idx]
+                else:
+                    thresholds[c_idx] = 0.50
         
+    # 4. Binary Decision Thresholding & Granular Class Audit
     preds = np.zeros_like(probabilities)
     sensitivity_list, specificity_list = [], []
+    per_class_p, per_class_r, per_class_f1, per_class_counts = [], [], [], []
+
     for c_idx in range(num_classes):
         preds[:, c_idx] = (probabilities[:, c_idx] > thresholds[c_idx]).astype(float)
         y_true, y_pred = targets[:, c_idx], preds[:, c_idx]
@@ -644,17 +795,76 @@ def execute_clinical_audit(
         
         sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        f1_c = 2 * prec * sens / (prec + sens) if (prec + sens) > 0 else 0.0
+
         if c_idx in active_class_indices:
             sensitivity_list.append(sens)
             specificity_list.append(spec)
+            per_class_p.append(prec)
+            per_class_r.append(sens)
+            per_class_f1.append(f1_c)
+            per_class_counts.append(targets[:, c_idx].sum())
 
-    macro_p, _, macro_f1, _ = precision_recall_fscore_support(
-        targets[:, active_class_indices], preds[:, active_class_indices], average='macro', zero_division=0
-    ) if active_class_indices else (0.0, 0.0, 0.0, 0.0)
-    
+    # Convert to arrays for vectorized macro weighting
+    p_arr = np.array(per_class_p)
+    r_arr = np.array(per_class_r)
+    spec_arr = np.array(specificity_list)
+    f1_arr = np.array(per_class_f1)
+    counts_arr = np.array(per_class_counts)
+
+    # 4a. Unweighted Macro Metrics
+    macro_p = np.mean(p_arr) if len(p_arr) > 0 else 0.0
+    macro_f1 = np.mean(f1_arr) if len(f1_arr) > 0 else 0.0
     macro_sens = np.mean(sensitivity_list) * 100 if sensitivity_list else 0.0
     macro_spec = np.mean(specificity_list) * 100 if specificity_list else 0.0
 
+    # 🚀 4b. Missing Global Micro Metrics (Micro F1, Micro Precision, Micro Recall)
+    active_targets = targets[:, active_class_indices]
+    active_preds = preds[:, active_class_indices]
+    
+    global_tp = np.sum((active_targets == 1) & (active_preds == 1))
+    global_fp = np.sum((active_targets == 0) & (active_preds == 1))
+    global_fn = np.sum((active_targets == 1) & (active_preds == 0))
+    
+    micro_p = (global_tp / (global_tp + global_fp)) * 100 if (global_tp + global_fp) > 0 else 0.0
+    micro_r = (global_tp / (global_tp + global_fn)) * 100 if (global_tp + global_fn) > 0 else 0.0
+    micro_f1 = (2 * micro_p * micro_r / (micro_p + micro_r)) if (micro_p + micro_r) > 0 else 0.0
+
+    # 4c. Prevalence-Weighted Macro Metrics
+    total_positives = np.sum(counts_arr)
+    if total_positives > 0:
+        class_weights = counts_arr / total_positives
+        weighted_macro_p = np.sum(p_arr * class_weights) * 100
+        weighted_macro_sens = np.sum(r_arr * class_weights) * 100
+        weighted_macro_spec = np.sum(spec_arr * class_weights) * 100  # 🚀 Added: Weighted Specificity
+        weighted_macro_f1 = np.sum(f1_arr * class_weights) * 100
+    else:
+        weighted_macro_p, weighted_macro_sens, weighted_macro_spec, weighted_macro_f1 = 0.0, 0.0, 0.0, 0.0
+
+    # 4d. Top-50 Most Frequent Diseases Benchmark
+    if len(counts_arr) > 0:
+        top50_k = min(50, len(counts_arr))
+        top50_indices = np.argsort(counts_arr)[::-1][:top50_k]
+        top50_macro_p = np.mean(p_arr[top50_indices]) * 100
+        top50_macro_sens = np.mean(r_arr[top50_indices]) * 100
+        top50_macro_spec = np.mean(spec_arr[top50_indices]) * 100  # 🚀 Added: Top-50 Specificity
+        top50_macro_f1 = np.mean(f1_arr[top50_indices]) * 100
+    else:
+        top50_macro_p, top50_macro_sens, top50_macro_spec, top50_macro_f1 = 0.0, 0.0, 0.0, 0.0
+
+    # 🚀 4e. Top-100 Most Frequent Diseases Benchmark
+    if len(counts_arr) > 0:
+        top100_k = min(100, len(counts_arr))
+        top100_indices = np.argsort(counts_arr)[::-1][:top100_k]
+        top100_macro_p = np.mean(p_arr[top100_indices]) * 100
+        top100_macro_sens = np.mean(r_arr[top100_indices]) * 100
+        top100_macro_spec = np.mean(spec_arr[top100_indices]) * 100
+        top100_macro_f1 = np.mean(f1_arr[top100_indices]) * 100
+    else:
+        top100_macro_p, top100_macro_sens, top100_macro_spec, top100_macro_f1 = 0.0, 0.0, 0.0, 0.0
+
+    # 5. Top-K Hit Rates & Precision@K
     hit1, hit3, hit5, hit8 = 0, 0, 0, 0
     p1_scores, p3_scores, p5_scores, p8_scores = [], [], [], []
     adaptive_hit_count = 0
@@ -685,6 +895,21 @@ def execute_clinical_audit(
         "macro_precision": macro_p * 100,
         "macro_sensitivity": macro_sens,
         "macro_specificity": macro_spec,
+        "micro_f1": micro_f1,
+        "micro_precision": micro_p,
+        "micro_sensitivity": micro_r,
+        "weighted_macro_f1": weighted_macro_f1,
+        "weighted_macro_precision": weighted_macro_p,
+        "weighted_macro_sensitivity": weighted_macro_sens,
+        "weighted_macro_specificity": weighted_macro_spec,
+        "top50_macro_f1": top50_macro_f1,
+        "top50_macro_precision": top50_macro_p,
+        "top50_macro_sensitivity": top50_macro_sens,
+        "top50_macro_specificity": top50_macro_spec,
+        "top100_macro_f1": top100_macro_f1,
+        "top100_macro_precision": top100_macro_p,
+        "top100_macro_sensitivity": top100_macro_sens,
+        "top100_macro_specificity": top100_macro_spec,
         "top1_rate": (hit1 / num_samples) * 100,
         "top3_rate": (hit3 / num_samples) * 100,
         "top5_rate": (hit5 / num_samples) * 100,
@@ -699,28 +924,10 @@ def execute_clinical_audit(
     }
 
     if not silent:
-        print("\n" + "═"*75)
-        print(" 🏥 COMPREHENSIVE CLINICAL MANIFOLD AUDIT REPORT")
-        print("═"*75)
-        if temp_alpha > 0.0:
-            print(f" 🧪 [CALIBRATION] Temperature Scaling Active (alpha = {temp_alpha})")
-            print("-" * 75)
-        print(f" 🩺 [TIER 1: RANKING]   Macro AUC-ROC:          {macro_auc_roc:3.2f}%")
-        print(f" 🩺 [TIER 1: RANKING]   Micro AUC-ROC:          {micro_auc_roc:3.2f}%")
-        print(f" 🩺 [TIER 1: RANKING]   Macro AUC-PR (Sparsity):{macro_auc_pr:3.2f}%")
-        print("-" * 75)
-        print(f" 🛡️ [TIER 2: BOUNDARY]  Calibrated Macro F1:    {metrics_summary['macro_f1']:3.2f}%")
-        print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Precision:        {metrics_summary['macro_precision']:3.2f}%")
-        print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Sensitivity (TPR):{macro_sens:3.2f}%")
-        print(f" 🛡️ [TIER 2: BOUNDARY]  Macro Specificity (TNR):{macro_spec:3.2f}%")
-        print("-" * 75)
-        print(f" 🚀 [ADAPTIVE HORIZON]  Hit Rate (Safety Net):  {metrics_summary['adaptive_hit_rate']:3.2f}%")
-        print(f" 🚀 [ADAPTIVE HORIZON]  Precision (Density):    {metrics_summary['adaptive_precision']:3.2f}%")
-        print("═"*75 + "\n")
-        print(f" ⚡ [TIER 3: FIXED K]   Top-1 Primary Hit Rate: {metrics_summary['top1_rate']:3.2f}% │ Precision@1: {metrics_summary['precision_at_1']:3.2f}%")
-        print(f" ⚡ [TIER 3: FIXED K]   Top-3 Differential Rate:{metrics_summary['top3_rate']:3.2f}% │ Precision@3: {metrics_summary['precision_at_3']:3.2f}%")
-        print(f" ⚡ [TIER 3: FIXED K]   Top-5 Differential Rate:{metrics_summary['top5_rate']:3.2f}% │ Precision@5: {metrics_summary['precision_at_5']:3.2f}%")
-        print(f" ⚡ [TIER 3: FIXED K]   Top-8 Differential Rate:{metrics_summary['top8_rate']:3.2f}% │ Precision@8: {metrics_summary['precision_at_8']:3.2f}%")
-        print("═"*75 + "\n")
+        print_clinical_audit_report(
+            metrics_summary=metrics_summary, 
+            temp_alpha=temp_alpha, 
+            calibration_beta=calibration_beta
+        )
         
     return metrics_summary

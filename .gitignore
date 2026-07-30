@@ -88,6 +88,7 @@ exports*./
 *.svg
 *.pdf
 *.log
+*.html
 
 # Telemetry CSV exports inside checkpoints or root
 telemetry_*.csv

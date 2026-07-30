@@ -1,24 +1,75 @@
 # scripts/build_features.py
+r"""
+====================================================================================================
+CHRONOS-JEPA OFFLINE DATASET TRAJECTORY UNROLLING & BPE TOKENIZATION PIPELINE
+====================================================================================================
+"""
 
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-import pandas as pd
-import numpy as np
+import os
 import re
 import json
+import pandas as pd
+import numpy as np
 from typing import List, Dict, Tuple, Any
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers
+
 from config import CardioConfig
 from src.Utils import clean_and_parse_numeric, clean_and_tokenize_text
 
 
-# ─── VOCABULARY BUILDER ───
-def build_unified_vocabularies(
+# ─── 1. BPE TOKENIZER TRAINER / LOADER ───
+def train_or_load_bpe_tokenizer(
+    corpus_texts: List[str], 
+    json_path: str, 
+    vocab_size: int
+) -> Tokenizer:
+    """
+    Trains or loads a custom Byte-Pair Encoding (BPE) subword tokenizer 
+    directly on medical lab outcomes and diagnostic report texts.
+    """
+    if os.path.exists(json_path):
+        print(f"📥 Loading existing medical BPE Tokenizer from -> {json_path}")
+        return Tokenizer.from_file(json_path)
+    
+    print(f"⚙️ Training custom medical BPE Tokenizer (Target Vocab Size = {vocab_size})...")
+    tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    
+    trainer = trainers.BpeTrainer(
+        vocab_size=vocab_size,
+        special_tokens=["[PAD]", "[UNK]"]
+    )
+    
+    valid_corpus = [t for t in corpus_texts if isinstance(t, str) and t.strip()]
+    tokenizer.train_from_iterator(valid_corpus, trainer)
+    tokenizer.save(json_path)
+    print(f"💾 Saved trained BPE Tokenizer artifact cleanly to -> {json_path}")
+    return tokenizer
+
+
+def encode_text_to_subwords(tokenizer: Tokenizer, text: str, max_subwords: int) -> List[int]:
+    """
+    Encodes clinical text into a fixed-width subword array padded/truncated with ID 0.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return [0] * max_subwords
+        
+    encoded = tokenizer.encode(text.strip().lower())
+    subword_ids = encoded.ids[:max_subwords]
+    if len(subword_ids) < max_subwords:
+        subword_ids += [0] * (max_subwords - len(subword_ids))
+    return subword_ids
+
+
+# ─── 2. VOCABULARY BUILDER ───
+def build_feature_codebook(
     xn_df: pd.DataFrame, 
-    cdha_df: pd.DataFrame, 
-    cfg: CardioConfig
-) -> Tuple[Dict[str, int], Dict[str, int]]:
+    cdha_df: pd.DataFrame
+) -> Dict[str, int]:
     feature_codebook = {
         'sbp': 0, 'dbp': 1, 'mach': 2, 'nhietdo': 3, 'cannang': 4, 'chieucao': 5,
         'tuoi': 6, 'phai': 7
@@ -35,30 +86,11 @@ def build_unified_vocabularies(
         normalized_tech = str(technique).strip().lower()
         if normalized_tech not in feature_codebook:
             feature_codebook[normalized_tech] = len(feature_codebook)
-        
-    cat_result_vocab = {
-        '[NUMERIC_ONLY]': 0, 'nam': 1, 'nu': 2
-    }
-    cat_idx = 3
-    
-    for val in xn_df['ketqua'].dropna().unique():
-        val_str = str(val).strip().lower()
-        if clean_and_parse_numeric(val_str) is None and val_str != "":
-            if val_str not in cat_result_vocab:
-                cat_result_vocab[val_str] = cat_idx
-                cat_idx += 1
-                
-    for text_block in cdha_df['ketluan'].dropna().unique():
-        words = clean_and_tokenize_text(text_block, stop_words=cfg.clinical_stop_words)
-        for word in words:
-            if word not in cat_result_vocab:
-                cat_result_vocab[word] = cat_idx
-                cat_idx += 1
-                
-    return feature_codebook, cat_result_vocab
+            
+    return feature_codebook
 
 
-# ─── STRATIFICATION ───
+# ─── 3. GREEDY MULTI-LABEL STRATIFICATION ───
 def greedy_multilabel_stratification(
     patients: List[str], 
     patient_labels: np.ndarray, 
@@ -100,43 +132,46 @@ def greedy_multilabel_stratification(
     return {patients[i] for i in range(num_patients) if assignments[i] == 1}
 
 
-# ─── TIMELINE RECORD CONSTRUCTOR HELPER ───
+# ─── 4. TIMELINE RECORD CONSTRUCTOR HELPER (3D SERIALIZATION) ───
 def create_timeline_record(
     sample_id: str,
     cutoff_date: pd.Timestamp,
-    active_history_raw: List[Tuple[pd.Timestamp, int, float, int]],
+    active_history_raw: List[Tuple[pd.Timestamp, int, float, List[int]]],
     max_seq_len: int,
     normalized_age: float,
     gender_cat_id: int,
     icd_ids: List[int]
 ) -> Dict[str, Any]:
-    """Slices events to max_seq_len and computes lookback duration relative to cutoff_date."""
+    """
+    Slices active history to max_seq_len and formats subword arrays as 
+    comma-separated blocks inside space-separated timeline sequences.
+    """
     if len(active_history_raw) > max_seq_len:
         active_history_raw = active_history_raw[-max_seq_len:]
         
-    # ⏳ COMPUTE REVERSED LOOKBACK DURATIONS (Target step acts as 0.0 anchor)
     final_timeline = []
-    for evt_date, f_id, v_num, c_id in active_history_raw:
+    for evt_date, f_id, v_num, c_subwords_block in active_history_raw:
         lookback_hours = float((cutoff_date - evt_date).total_seconds() / 3600.0)
-        final_timeline.append((lookback_hours, f_id, v_num, c_id))
+        subwords_str = ",".join(str(s) for s in c_subwords_block)
+        final_timeline.append((lookback_hours, f_id, v_num, subwords_str))
     
     return {
         'mabn': sample_id,
-        'cutoff_idx': len(final_timeline) - 1, # Direct absolute coordinate matching
-        'age': float(normalized_age),          # Explicit DataFrame extraction
-        'gender': int(gender_cat_id),          # Explicit DataFrame extraction
+        'cutoff_idx': len(final_timeline) - 1,
+        'age': float(normalized_age),
+        'gender': int(gender_cat_id),
         'timestamps': " ".join([f"{e[0]:.4f}" for e in final_timeline]),
         'feature_ids': " ".join([str(e[1]) for e in final_timeline]),
         'numeric_values': " ".join([f"{e[2]:.4f}" for e in final_timeline]),
-        'cat_result_ids': " ".join([str(e[3]) for e in final_timeline]),
+        'cat_result_ids': " ".join([e[3] for e in final_timeline]),  # Space-separated subword blocks
         'icd_targets': " ".join([str(i) for i in icd_ids])
     }
 
 
-# ─── MAIN UNROLLING PIPELINE ───
+# ─── 5. MAIN UNROLLING PIPELINE ───
 if __name__ == "__main__":
     cfg = CardioConfig()
-    print("=== Launching Offline Dataset Trajectory Unrolling Pipeline ===")
+    print("=== Launching Offline Dataset Trajectory Unrolling Pipeline (3D BPE Embedder Edition) ===")
     
     cdha_df = pd.read_csv(cfg.master_cdha_csv, dtype=str)
     xn_df = pd.read_csv(cfg.master_xn_csv, dtype=str)
@@ -147,7 +182,16 @@ if __name__ == "__main__":
     cdha_df = cdha_df.dropna(subset=['mabn', 'parsed_date']).reset_index(drop=True)
     xn_df = xn_df.dropna(subset=['mabn', 'parsed_date']).reset_index(drop=True)
     
-    feature_codebook, cat_result_vocab = build_unified_vocabularies(xn_df, cdha_df, cfg)
+    # 🚀 Train or load medical BPE Tokenizer using config attributes
+    bpe_corpus = xn_df['ketqua'].dropna().tolist() + cdha_df['ketluan'].dropna().tolist()
+    bpe_json_path = os.path.join(cfg.checkpoint_dir, cfg.bpe_tokenizer_filename)
+    bpe_tokenizer = train_or_load_bpe_tokenizer(
+        corpus_texts=bpe_corpus, 
+        json_path=bpe_json_path, 
+        vocab_size=cfg.bpe_vocab_size
+    )
+    
+    feature_codebook = build_feature_codebook(xn_df, cdha_df)
     
     cdha_df['maicd'] = cdha_df['maicd'].fillna("UNKNOWN").astype(str).str.strip()
     all_icd_classes = sorted(cdha_df['maicd'].unique())
@@ -174,7 +218,10 @@ if __name__ == "__main__":
     train_patients_scanned, val_patients_scanned = 0, 0
     xn_grouped = xn_df.groupby('mabn', sort=False)
     
-    print("⏳ Unrolling patient trajectories into pre-computed step slices...")
+    # 🚀 Zero-subword array for pure numeric events using cfg.max_subwords
+    NUMERIC_SUBWORDS_PAD = [0] * cfg.max_subwords
+
+    print("⏳ Unrolling patient trajectories into pre-computed 3D step slices...")
     for mabn, p_cdha in cdha_df.groupby('mabn', sort=False):
         if mabn not in xn_grouped.groups:
             continue
@@ -191,13 +238,12 @@ if __name__ == "__main__":
         
         first_cdha_row = p_cdha.iloc[0]
         raw_age = clean_and_parse_numeric(first_cdha_row.get('tuoi', 0)) or 0.0
-        normalized_age = max(min(raw_age / 100.0, 1.0), 0.0)
+        normalized_age = max(min(raw_age / cfg.age_normalization_factor, 1.0), 0.0)
         
         raw_gender = str(first_cdha_row.get('phai', '')).strip().lower()
-        gender_key = 'nam' if raw_gender in ['nam', 'm', 'male', '1'] else 'nu'
-        gender_cat_id = cat_result_vocab.get(gender_key, 0)
+        gender_cat_id = 1 if raw_gender in ['nam', 'm', 'male', '1'] else 2
         
-        # Ingest Laboratory Tracks
+        # 🚀 Ingest Laboratory Tracks
         for _, x_row in p_xn.iterrows():
             evt_date = x_row['parsed_date']
             hp = str(x_row.get('huyetap', ''))
@@ -207,10 +253,10 @@ if __name__ == "__main__":
                     s_num, d_num = clean_and_parse_numeric(s_str), clean_and_parse_numeric(d_str)
                     if s_num:
                         clipped_s = float(max(min(s_num, cfg.clinical_bounds['sbp'][1]), cfg.clinical_bounds['sbp'][0]))
-                        raw_interleaved_events.append((evt_date, feature_codebook['sbp'], clipped_s, 0))
+                        raw_interleaved_events.append((evt_date, feature_codebook['sbp'], clipped_s, NUMERIC_SUBWORDS_PAD))
                     if d_num:
                         clipped_d = float(max(min(d_num, cfg.clinical_bounds['dbp'][1]), cfg.clinical_bounds['dbp'][0]))
-                        raw_interleaved_events.append((evt_date, feature_codebook['dbp'], clipped_d, 0))
+                        raw_interleaved_events.append((evt_date, feature_codebook['dbp'], clipped_d, NUMERIC_SUBWORDS_PAD))
                 except ValueError:
                     pass
 
@@ -218,7 +264,7 @@ if __name__ == "__main__":
                 v_num = clean_and_parse_numeric(x_row.get(field))
                 if v_num:
                     clipped_v = float(max(min(v_num, cfg.clinical_bounds[field][1]), cfg.clinical_bounds[field][0]))
-                    raw_interleaved_events.append((evt_date, feature_codebook[field], clipped_v, 0))
+                    raw_interleaved_events.append((evt_date, feature_codebook[field], clipped_v, NUMERIC_SUBWORDS_PAD))
                     
             lab_name = str(x_row.get('tenxn', '')).strip().lower()
             if lab_name in feature_codebook:
@@ -226,11 +272,12 @@ if __name__ == "__main__":
                 res_str = str(x_row.get('ketqua', '')).strip().lower()
                 num_parsed = clean_and_parse_numeric(res_str)
                 if num_parsed is not None:
-                    raw_interleaved_events.append((evt_date, f_id, float(num_parsed), 0))
-                elif res_str in cat_result_vocab:
-                    raw_interleaved_events.append((evt_date, f_id, 0.0, cat_result_vocab[res_str]))
+                    raw_interleaved_events.append((evt_date, f_id, float(num_parsed), NUMERIC_SUBWORDS_PAD))
+                elif res_str:
+                    subwords_block = encode_text_to_subwords(bpe_tokenizer, res_str, max_subwords=cfg.max_subwords)
+                    raw_interleaved_events.append((evt_date, f_id, 0.0, subwords_block))
 
-        # Ingest Diagnostic Report Tracks
+        # 🚀 Ingest Diagnostic Report Tracks (1 Report = Exactly 1 Event Tuple!)
         for _, c_row in p_cdha.iterrows():
             evt_date = c_row['parsed_date']
             technique = str(c_row.get('kythuatcdha', '')).strip().lower()
@@ -238,15 +285,12 @@ if __name__ == "__main__":
             
             if technique in feature_codebook:
                 f_id = feature_codebook[technique]
-                ef_match = re.search(r"ef\s*=\s*(\d+)", text_summary.lower())
+                ef_match = re.search(cfg.ef_regex_pattern, text_summary.lower())
                 extracted_numeric = float(ef_match.group(1)) if ef_match else 0.0
                 
-                words = clean_and_tokenize_text(text_summary, stop_words=cfg.clinical_stop_words)
-                if words:
-                    for word in words:
-                        raw_interleaved_events.append((evt_date, f_id, extracted_numeric, cat_result_vocab.get(word, 0)))
-                else:
-                    raw_interleaved_events.append((evt_date, f_id, extracted_numeric, 0))
+                subwords_block = encode_text_to_subwords(bpe_tokenizer, text_summary, max_subwords=cfg.max_subwords)
+                # Appends 1 single positionally-locked event tuple for the entire report:
+                raw_interleaved_events.append((evt_date, f_id, extracted_numeric, subwords_block))
 
         if not raw_interleaved_events:
             continue
@@ -257,6 +301,7 @@ if __name__ == "__main__":
         if not icd_ids:
             continue
 
+        # 🚀 1-Step Shift Trajectory Slicing Loop Preserved
         if is_train:
             for step_idx in range(1, len(raw_interleaved_events)):
                 cutoff_date = raw_interleaved_events[step_idx][0]
@@ -293,14 +338,14 @@ if __name__ == "__main__":
     master_codebooks = {
         "metadata": {
             "num_total_features": len(feature_codebook), 
-            "num_cat_results": len(cat_result_vocab), 
+            "num_cat_results": bpe_tokenizer.get_vocab_size(), 
             "num_icd_classes": len(icd_codebook)
         },
         "forward_maps": {
-            "features": feature_codebook, "categorical_results": cat_result_vocab, "icd_codes": icd_codebook
+            "features": feature_codebook, 
+            "icd_codes": icd_codebook
         },
         "inverse_maps": {str(v): k for k, v in feature_codebook.items()},
-        "inverse_categorical_results": {str(v): k for k, v in cat_result_vocab.items()},
         "inverse_icd_codes": {str(v): k for k, v in icd_codebook.items()}
     }
     
@@ -311,10 +356,14 @@ if __name__ == "__main__":
     print(" 📊 OFFLINE STRATIFIED TRAJECTORY UNROLLING COMPILATION REPORT")
     print("═"*80)
     print(f" 📑 TRAINING COHORT CONFIGURATION:")
-    print(f"   • Raw Patient Timelines Scanned:      {train_patients_scanned:,} cases")
-    print(f"   • Active Pre-Flattened Slices Written: {len(train_flattened_rows):,} samples")
+    print(f"   • Raw Patient Timelines Scanned:       {train_patients_scanned:,} cases")
+    print(f"   • Active Pre-Flattened Slices Written:  {len(train_flattened_rows):,} samples")
     print("-" * 80)
     print(f" 📑 VALIDATION COHORT CONFIGURATION:")
-    print(f"   • Raw Patient Timelines Scanned:      {val_patients_scanned:,} cases")
-    print(f"   • Active Pre-Flattened Slices Written: {len(val_flattened_rows):,} samples")
+    print(f"   • Raw Patient Timelines Scanned:       {val_patients_scanned:,} cases")
+    print(f"   • Active Pre-Flattened Slices Written:  {len(val_flattened_rows):,} samples")
+    print("-" * 80)
+    print(f" 📑 BPE SUBWORD EMBEDDER CONFIGURATION:")
+    print(f"   • Medical BPE Vocabulary Size:        {bpe_tokenizer.get_vocab_size():,} subwords")
+    print(f"   • Max Subwords Per Event Step:         {cfg.max_subwords} subwords")
     print("═"*80 + "\n")

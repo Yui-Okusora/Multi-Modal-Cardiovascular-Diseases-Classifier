@@ -17,6 +17,7 @@ class CardioConfig:
     xai_export_dir: str = "./xai_exports"
     
     # Artifact File Names
+    bpe_tokenizer_filename: str = "clinical_bpe_tokenizer.json"
     best_ssl_backbone_filename: str = "best_ssl_backbone.pt"
     unified_intermediary_filename: str = "unified_jepa_and_probe_checkpoint.pt"
     unified_final_filename: str = "unified_jepa_and_probe.pt"
@@ -26,6 +27,11 @@ class CardioConfig:
     # ─── 2. DATA PROCESSING & FEATURE BOUNDS ───
     train_split_ratio: float = 0.65
     random_seed: int = 42
+    bpe_vocab_size: int = 1500             # Bounded BPE subword vocabulary size
+    max_subwords: int = 16                 # Fixed width window of subwords per event step
+    age_normalization_factor: float = 100.0
+    ef_regex_pattern: str = r"ef\s*=\s*(\d+)"
+    
     clinical_bounds: Dict[str, Tuple[float, float]] = field(default_factory=lambda: {
         'sbp': (70.0, 200.0),       
         'dbp': (40.0, 130.0),       
@@ -40,14 +46,14 @@ class CardioConfig:
     })
 
     # ─── 3. ARCHITECTURE & LATENT DIMENSIONS ───
-    latent_dim: int = 512                  # Dimensionality of the shared latent space
+    latent_dim: int = 512                  # Dimensionality of shared latent space
     max_sequence_len: int = 256            # Max chronological sequence timeline tokens
     max_targets: int = 10                  # Max multi-label ICD targets recorded per patient
     num_slots: int = 24                    # Number of Perceiver latent pooling query slots
     augmented_slots: int = 26              # 24 dynamic slots + 1 age + 1 gender
     encoder_layers: int = 6                # Transformer Encoder layers in Context/Target backbones
     nhead: int = 8                         # Transformer attention heads
-    fourier_frequencies: int = 32          # Fourier frequency channels for periodic numerical embeddings
+    fourier_frequencies: int = 32          # Fourier frequency channels for numerical embeddings
     
     probe_type: str = "attentive"          # Options: "attentive" (Hopfield+LAAT) or "linear"
     num_prototypes: int = 64               # Hopfield memory prototype centroids
@@ -65,16 +71,17 @@ class CardioConfig:
 
     # ─── 5. HARDWARE & COMPUTE ROUTING ───
     device: torch.device = field(default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    batch_size: int = 256                  # Restored from 4 to 256 for stable VICReg statistics
+    batch_size: int = 128                  # Physical batch size
+    effective_batch_size: int = 256        # 🚀 Effective batch size
     grad_clip_norm: float = 1.0
     use_amp: bool = True
     amp_dtype: torch.dtype = torch.bfloat16
-    patience: int = 4                      # Early-stopping patience budget (epochs)
+    patience: int = 5                      # Early-stopping patience budget (epochs)
     log_interval: int = 50                 # Logging step cadence
 
     # ─── 6. PHASE 1: SELF-SUPERVISED PRETRAINING (JEPA) ───
     k_min: int = 2                         # Minimum dynamic masking target horizon
-    k_max: int = 6                         # Maximum dynamic masking target horizon
+    k_max: int = 24                        # Maximum dynamic masking target horizon
     alpha_align: float = 25.0              # L1 Smooth Alignment Loss weight
     alpha_var: float = 25.0                # Projected VICReg Variance Loss weight
     alpha_backbone_v: float = 150.0        # Direct Backbone Variance Loss weight
@@ -84,7 +91,7 @@ class CardioConfig:
     target_std: float = 0.20               # Target feature standard deviation floor
     tau: float = 0.996                     # Momentum EMA coefficient for Target Encoder
     pretrain_lr: float = 4.2e-4
-    pretrain_epochs: int = 10
+    pretrain_epochs: int = 20
     pretrain_wgt_decay: float = 1e-2
     pretrain_warmup_ratio: float = 0.15
 
@@ -92,14 +99,14 @@ class CardioConfig:
     probe_lr: float = 2e-4
     probe_lr_backbone_scale: float = 0.25  # Scaler for fine-tuning backbone LoRA weights
     probe_lr_assembler_scale: float = 0.50 # Scaler for Manifold Assembler weights
-    probe_epochs: int = 10
+    probe_epochs: int = 20
     probe_wgt_decay: float = 1e-4
     
     # Class-Aware Asymmetric Loss (ASL) Hyperparameters
     asl_gamma_pos: float = 0.0
-    asl_gamma_neg_base: float = 4.5
-    asl_beta_neg_base: float = 2.5
-    asl_delta_beta: float = 1.0            # Dynamic boost for rare long-tail classes
+    asl_gamma_neg_base: float = 1.0        # Bounded base exponent to prevent precision collapse
+    asl_beta_neg_base: float = 1.0
+    asl_delta_beta: float = 0.5            # Dynamic boost for rare long-tail classes
     
     # Phase 2 Multi-Task Loss Weighting
     loss_weight_cls: float = 1.00

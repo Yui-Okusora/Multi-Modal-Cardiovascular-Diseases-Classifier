@@ -13,7 +13,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from config import CardioConfig
 from Pipeline import ClinicalPipeline
 from src.ModelModules import (
-    UnifiedSystemicTokenizer,
+    UnifiedSystemicEmbedder,
     PerceiverLatentPooling,
     LinearProbeHead
 )
@@ -27,13 +27,15 @@ logging.getLogger('matplotlib').setLevel(logging.WARNING)
 
 def create_benchmark_batch(cfg: CardioConfig, benchmark_bs: int, num_feats: int = 100, num_cats: int = 50) -> Dict[str, Any]:
     L = cfg.max_sequence_len
+    subwords = cfg.max_subwords
     device = cfg.device
     return {
         'patient_session_id': [f"pat_{i}" for i in range(benchmark_bs)],
         'feature_ids': torch.randint(1, num_feats, (benchmark_bs, L), device=device),
         'numeric_values': torch.randn(benchmark_bs, L, device=device),
-        'cat_result_ids': torch.randint(0, num_cats, (benchmark_bs, L), device=device),
+        'cat_result_ids': torch.randint(0, num_cats, (benchmark_bs, L, subwords), device=device),
         'timestamps': torch.sort(torch.rand(benchmark_bs, L, device=device) * 100.0, dim=-1, descending=True)[0],
+        'base_mask': torch.zeros(benchmark_bs, L, dtype=torch.bool, device=device),
         'student_mask': torch.zeros(benchmark_bs, L, dtype=torch.bool, device=device),
         'teacher_mask': torch.zeros(benchmark_bs, L, dtype=torch.bool, device=device),
         'age': torch.rand(benchmark_bs, device=device),
@@ -117,7 +119,7 @@ class VRAMFootprintProfiler:
         num_cls   = pipeline.num_icd_classes
         D, K, K_aug = self.cfg.latent_dim, self.cfg.num_slots, pipeline.augmented_slots
 
-        tokenizer      = UnifiedSystemicTokenizer(num_feats, num_cats, d_model=D, num_frequencies=self.cfg.fourier_frequencies).to(self.device)
+        tokenizer      = UnifiedSystemicEmbedder(num_feats, num_cats, d_model=D, num_frequencies=self.cfg.fourier_frequencies).to(self.device)
         perceiver      = PerceiverLatentPooling(num_slots=K, d_model=D).to(self.device)
         probe_linear   = LinearProbeHead(in_slots=K_aug, in_dim=D, num_classes=num_cls, dropout_p=self.cfg.probe_dropout).to(self.device)
 
@@ -147,7 +149,6 @@ class VRAMFootprintProfiler:
             ("E2E Phase 2 Probing Pass", lambda b: pipeline.process_batch(b, self.device, run_teacher=False), (self.batch,))
         ]
 
-        # ─── SECTION 1: STATIC WEIGHT BREAKDOWN WITH LABELS ───
         print("\n📦 1. MODULE STATIC WEIGHT & BUFFER VRAM BREAKDOWN:")
         print("─"*105)
         print(f"   {'MODULE NAME':<42} │ {'TOTAL PARAMS':<14} │ {'TRAINABLE':<14} │ {'WEIGHT VRAM':<12}")
@@ -167,7 +168,6 @@ class VRAMFootprintProfiler:
         print(f"   STATIC SUMMARY TOTALS                      │ {tot_all_params:12,} │ {trn_all_params:12,} │ VRAM: {static_vram_sum:8.2f} MB")
         print("═"*105)
 
-        # ─── SECTION 2: DYNAMIC PASS PROFILING WITH LABELS ───
         print("\n⚡ 2. DYNAMIC FORWARD & BACKWARD PASS VRAM PROFILING:")
         print("─"*105)
         print(f"   {'MODULE NAME':<42} │ {'INFERENCE (NO-GRAD)':<18} │ {'TRAIN (FWD ONLY)':<18} │ {'TRAIN (FWD+BWD)':<18}")

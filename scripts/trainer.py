@@ -9,8 +9,12 @@ import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader
 
-from src.TimelineDataset import BVTDFlattenedDataset, compute_static_class_frequencies
-from src.ModelModules import compute_comprehensive_manifold_diagnostics, ClassAwareASL, execute_clinical_audit
+from src.TimelineDataset import BVTDFlattenedDataset, seed_worker, compute_static_class_frequencies
+from src.ModelModules import (
+    compute_comprehensive_manifold_diagnostics, 
+    ClassAwareASL, 
+    execute_clinical_audit
+)
 from src.BaseEngine import BaseExecutionEngine
 from src.LoRAWrapper import defactorize_entire_architecture
 from config import CardioConfig
@@ -61,8 +65,9 @@ class DualPhaseTrainingEngine(BaseExecutionEngine):
 
         self.val_loader = DataLoader(
             BVTDFlattenedDataset(
-                cfg.val_csv_path, 
+                preprocessed_csv_path=cfg.val_csv_path, 
                 max_seq_len=cfg.max_sequence_len, 
+                max_subwords=cfg.max_subwords,
                 max_targets=cfg.max_targets,
                 is_train=False
             ), 
@@ -193,7 +198,7 @@ class DualPhaseTrainingEngine(BaseExecutionEngine):
 
         total_steps = len(train_loader) * self.cfg.pretrain_epochs
         warmup_steps = int(total_steps * self.cfg.pretrain_warmup_ratio)
-        p1_scheduler = self.create_warmup_cosine_scheduler(p1_optimizer, warmup_steps, total_steps, min_lr_ratio=0.0)
+        p1_scheduler = self.create_warmup_cosine_scheduler(p1_optimizer, warmup_steps, total_steps, min_lr_ratio=0.01)
 
         with torch.no_grad():
             print("🔄 Synchronizing pristine base parameters to Target Encoder state maps...")
@@ -436,6 +441,12 @@ class DualPhaseTrainingEngine(BaseExecutionEngine):
         defactorize_entire_architecture(self.context_encoder)
         self._export_unified_checkpoint(is_final=True)
 
+    def _export_checkpoint(self, state_dict: dict, filename: str):
+        checkpoint_path = os.path.join(self.cfg.checkpoint_dir, filename)
+        os.makedirs(self.cfg.checkpoint_dir, exist_ok=True)
+        torch.save(state_dict, checkpoint_path)
+        print(f"💾 [CHECKPOINT EXPORT] Saved Phase 1 SSL backbone artifact cleanly -> {checkpoint_path}")
+
     def _export_unified_checkpoint(self, is_final: bool = False):
         filename = self.cfg.unified_final_filename if is_final else self.cfg.unified_intermediary_filename
         checkpoint_path = os.path.join(self.cfg.checkpoint_dir, filename)
@@ -448,38 +459,47 @@ class DualPhaseTrainingEngine(BaseExecutionEngine):
 if __name__ == "__main__":
     cfg = CardioConfig()
     
+    g = torch.Generator()
+    g.manual_seed(cfg.random_seed)
+
     p1_train_loader = DataLoader(
         BVTDFlattenedDataset(
-            cfg.train_csv_path, 
+            preprocessed_csv_path=cfg.train_csv_path, 
             max_seq_len=cfg.max_sequence_len, 
-            max_targets=cfg.max_targets,
+            max_subwords=cfg.max_subwords,     
+            max_targets=cfg.max_targets,       
             is_train=True,
             k_min=cfg.k_min,
             k_max=cfg.k_max
         ), 
         batch_size=cfg.batch_size,
-        shuffle=True, drop_last=True, num_workers=2, pin_memory=True, persistent_workers=True, prefetch_factor=2
+        shuffle=True, drop_last=True, num_workers=2, 
+        worker_init_fn=seed_worker,            
+        generator=g,                           
+        pin_memory=True, persistent_workers=True, prefetch_factor=2
     )
 
     p2_train_loader = DataLoader(
         BVTDFlattenedDataset(
-            cfg.train_csv_path, 
+            preprocessed_csv_path=cfg.train_csv_path, 
             max_seq_len=cfg.max_sequence_len, 
-            max_targets=cfg.max_targets,
+            max_subwords=cfg.max_subwords,     
+            max_targets=cfg.max_targets,       
             is_train=False
         ), 
         batch_size=cfg.batch_size,
-        shuffle=True, drop_last=True, num_workers=2, pin_memory=True, persistent_workers=True, prefetch_factor=2
+        shuffle=True, drop_last=True, num_workers=2, 
+        worker_init_fn=seed_worker,            
+        generator=g,                           
+        pin_memory=True, persistent_workers=True, prefetch_factor=2
     )
     
     engine = DualPhaseTrainingEngine(cfg)
     best_ssl_path = os.path.join(cfg.checkpoint_dir, cfg.best_ssl_backbone_filename)
     
     # ─── EXECUTION STAGES ───
-    # Uncomment run_phase1_pretraining if training from scratch:
-    # engine.run_phase1_pretraining(p1_train_loader)
+    engine.run_phase1_pretraining(p1_train_loader)
     
-    # Run Phase 2 probe fitting:
     engine.run_phase2_probe_fitting(
         p2_train_loader, 
         load_checkpoint_path=best_ssl_path if os.path.exists(best_ssl_path) else None

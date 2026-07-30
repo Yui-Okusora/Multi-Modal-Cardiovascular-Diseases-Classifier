@@ -11,7 +11,8 @@ class BaseExecutionEngine:
     """
     🎯 CENTRAL RUNTIME ORCHESTRATOR: Highly scalable functional optimization loop.
     Supports mixed precision, dynamic AMP datatypes, precision-isolated reduction filters,
-    and full telemetry snapshot reporting with safe state-resumption.
+    gradient accumulation (decoupled physical & effective batch sizes), and full telemetry 
+    snapshot reporting with safe state-resumption.
     """
     def __init__(self, cfg):
         self.cfg = cfg
@@ -75,6 +76,22 @@ class BaseExecutionEngine:
         self.used_tag.append(tag)
         session_file = os.path.join(self.cfg.checkpoint_dir, f"engine_state_{tag.lower().replace(' ', '_')}.pt")
         
+        # -------------------------------------------------------------
+        # 🚀 GRADIENT ACCUMULATION RESOLUTION
+        # -------------------------------------------------------------
+        physical_bs = getattr(self.cfg, 'batch_size', 32)
+        grad_accum_steps = getattr(self.cfg, 'grad_accum_steps', None)
+        if grad_accum_steps is None:
+            effective_bs = getattr(self.cfg, 'effective_batch_size', physical_bs)
+            accum_steps = max(1, effective_bs // physical_bs)
+        else:
+            accum_steps = max(1, grad_accum_steps)
+            effective_bs = physical_bs * accum_steps
+
+        # Align log interval to nearest multiple of accum_steps so logs always land on update steps
+        raw_log_interval = getattr(self.cfg, 'log_interval', 50)
+        aligned_log_interval = max(accum_steps, (raw_log_interval // accum_steps) * accum_steps)
+
         resume_session = False
         start_epoch, start_batch, global_step_idx, accumulated_duration = 0, -1, 0, 0.0
         target_dtype, use_scaler = self.amp_dtype, (self.use_amp and self.amp_dtype == torch.float16)
@@ -119,10 +136,15 @@ class BaseExecutionEngine:
         
         print(f"🚀 Initiating High-Order Optimization Pass: [{tag.upper()}] | Budget: {num_epochs} Epochs")
         print(f"⚙️ Precision Settings: AMP Enabled={self.use_amp} | Target Datatype={target_dtype}")
+        print(f"📦 Batch Config: Physical={physical_bs} | Effective={effective_bs} | Accumulation Steps={accum_steps}")
+        
         loop_start_time = time.perf_counter()
+        last_grad_norm = 0.0
         
         for epoch in range(start_epoch, num_epochs):
             epoch_start = time.perf_counter()
+            optimizer.zero_grad()  # Initialize gradients for epoch
+
             for batch_idx, batch in enumerate(data_loader):
                 if epoch == start_epoch and batch_idx <= start_batch: 
                     continue
@@ -130,9 +152,15 @@ class BaseExecutionEngine:
                     torch.cuda.reset_peak_memory_stats(self.device)
                     
                 batch_start = time.perf_counter()
-                optimizer.zero_grad()
-                batch_size = batch['feature_ids'].size(0) if 'feature_ids' in batch else self.cfg.batch_size
+                current_batch_size = batch['feature_ids'].size(0) if 'feature_ids' in batch else physical_bs
                 
+                # Check if this physical batch triggers an optimizer step or is end-of-epoch flush
+                is_update_step = ((batch_idx + 1) % accum_steps == 0) or (batch_idx + 1 == len(data_loader))
+                is_log_batch = ((batch_idx + 1) % aligned_log_interval == 0) or (batch_idx + 1 == len(data_loader))
+                
+                # -------------------------------------------------------------
+                # 1. FORWARD PASS & UN-SCALED LOSS LOGGING
+                # -------------------------------------------------------------
                 with torch.amp.autocast('cuda', dtype=target_dtype, enabled=self.use_amp):
                     loss_output = loss_fn_lambda(batch, global_step_idx, len(data_loader) * num_epochs)
                     total_loss, component_logs = 0.0, []
@@ -153,42 +181,62 @@ class BaseExecutionEngine:
                             if k != "total": 
                                 component_logs.append(f"{short_name}:{raw_loss.item():.3f}")
 
+                # -------------------------------------------------------------
+                # 2. NORMALIZED BACKWARD PASS (Prevent gradient scaling explosion)
+                # -------------------------------------------------------------
+                loss_to_backward = total_loss / accum_steps
+
                 if not use_scaler:
-                    total_loss.backward()
-                    grad_norm = self._compute_grad_norm(trainable_params)
-                    torch.nn.utils.clip_grad_norm_(trainable_params, self.cfg.grad_clip_norm)
-                    optimizer.step()
+                    loss_to_backward.backward()
                 else:
-                    self.scaler.scale(total_loss).backward()
-                    self.scaler.unscale_(optimizer)
-                    grad_norm = self._compute_grad_norm(trainable_params)
-                    torch.nn.utils.clip_grad_norm_(trainable_params, self.cfg.grad_clip_norm)
-                    self.scaler.step(optimizer)
-                    self.scaler.update()
-                
-                if scheduler is not None: scheduler.step()
-                if after_step is not None: after_step()
+                    self.scaler.scale(loss_to_backward).backward()
+
+                # -------------------------------------------------------------
+                # 3. CONDITIONAL OPTIMIZER STEP & GRADIENT CLIPPING
+                # -------------------------------------------------------------
+                if is_update_step:
+                    if not use_scaler:
+                        last_grad_norm = self._compute_grad_norm(trainable_params)
+                        torch.nn.utils.clip_grad_norm_(trainable_params, self.cfg.grad_clip_norm)
+                        optimizer.step()
+                    else:
+                        self.scaler.unscale_(optimizer)
+                        last_grad_norm = self._compute_grad_norm(trainable_params)
+                        torch.nn.utils.clip_grad_norm_(trainable_params, self.cfg.grad_clip_norm)
+                        self.scaler.step(optimizer)
+                        self.scaler.update()
+
+                    optimizer.zero_grad()
+                    if scheduler is not None:
+                        scheduler.step()
+
+                    if after_step is not None: 
+                        after_step()
                     
                 step_duration = time.perf_counter() - batch_start
-                samples_per_sec = batch_size / step_duration if step_duration > 0 else 0.0
+                samples_per_sec = current_batch_size / step_duration if step_duration > 0 else 0.0
                 current_lr = optimizer.param_groups[0]['lr']
                 vram_gb = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
                 
+                # -------------------------------------------------------------
+                # 4. TELEMETRY RECORDING
+                # -------------------------------------------------------------
                 metrics["epoch"].append(epoch + 1)
                 metrics["batch"].append(batch_idx)
                 metrics["global_step"].append(global_step_idx)
-                metrics["loss"].append(total_loss.item())
-                metrics["grad_norm"].append(grad_norm)
+                metrics["loss"].append(total_loss.item())  # Log exact unscaled physical loss
+                metrics["grad_norm"].append(last_grad_norm)
                 metrics["lr"].append(current_lr)
                 metrics["vram_gb"].append(vram_gb)
                 metrics["samples_per_sec"].append(samples_per_sec)
                 global_step_idx += 1
                 
-                if batch_idx % self.cfg.log_interval == 0 or batch_idx == len(data_loader) - 1:
+                if is_log_batch:
                     comp_str = " ｜ ".join(component_logs) if component_logs else "No active sub-components"
+                    accum_tag = "⚡ STEP" if is_update_step else "⏳ ACCUM"
                     print(
-                        f"⚡ [{tag:<12}] E{epoch+1:02d} B{batch_idx:03d}/{len(data_loader):03d} │ "
-                        f"L_tot: {total_loss.item():.4f} │ G: {grad_norm:5.2f} │ "
+                        f"{accum_tag} [{tag:<12}] E{epoch+1:02d} B{batch_idx:03d}/{len(data_loader):03d} │ "
+                        f"L_tot: {total_loss.item():.4f} │ G: {last_grad_norm:5.2f} │ "
                         f"LR: {current_lr:.1e} │ {vram_gb:.1f}GB │ {samples_per_sec:.0f}sam/s │ 🧬 {comp_str}"
                     )
                     

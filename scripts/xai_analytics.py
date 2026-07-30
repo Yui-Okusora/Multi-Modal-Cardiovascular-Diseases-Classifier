@@ -173,6 +173,7 @@ class AdvancedClinicalAnalyticsEngine:
                 v_nums = batch['numeric_values'].to(self.device)
                 c_ids  = batch['cat_result_ids'].to(self.device)
                 times  = batch['timestamps'].to(self.device)
+                s_mask = batch['student_mask'].to(self.device)
 
                 tokenizer = pipeline.context_encoder.tokenizer
                 tokens = tokenizer(f_ids, v_nums, c_ids, times)
@@ -181,9 +182,13 @@ class AdvancedClinicalAnalyticsEngine:
                     tokens = pipeline.context_encoder.pos_embedder(tokens)
 
                 norm_tokens = F.normalize(tokens.float(), p=2, dim=-1)
-                batch_routing = torch.bmm(norm_tokens, norm_tokens.transpose(1, 2))
+                batch_routing = torch.bmm(norm_tokens, norm_tokens.transpose(1, 2)).cpu().numpy()
                 
-                accum_routing += batch_routing.mean(dim=0).cpu().numpy()
+                # Mask out padding tokens so padded pairs are strictly 0.0
+                valid_mask = (~s_mask.cpu()).float().numpy()[:, :, None]
+                batch_routing = batch_routing * valid_mask * np.transpose(valid_mask, (0, 2, 1))
+                
+                accum_routing += batch_routing.mean(axis=0)
                 total_batches += 1
                 if total_batches >= 25: break
 
@@ -255,8 +260,14 @@ class AdvancedClinicalAnalyticsEngine:
             curr_b = f.size(0)
             batch_dict = {
                 'patient_session_id': ["anal_pat"] * curr_b,
-                'feature_ids': f, 'numeric_values': v, 'cat_result_ids': c, 'timestamps': t, 'student_mask': s_mask,
-                'age': age, 'gender': gender,
+                'feature_ids': f, 
+                'numeric_values': v, 
+                'cat_result_ids': c, 
+                'timestamps': t, 
+                'base_mask': s_mask,
+                'student_mask': s_mask,
+                'age': age, 
+                'gender': gender,
                 'icd_targets': torch.zeros(curr_b, 1, dtype=torch.long, device=f.device),
                 'target_mask': torch.zeros(curr_b, 1, dtype=torch.bool, device=f.device)
             }
@@ -267,7 +278,7 @@ class AdvancedClinicalAnalyticsEngine:
         target_layers = [
             tokenizer_mod.feature_embedding,      
             tokenizer_mod.numeric_encoder,           
-            tokenizer_mod.cat_result_embedding,   
+            tokenizer_mod.text_encoder,   
             tokenizer_mod.time_embedder           
         ]
         
@@ -343,7 +354,7 @@ class AdvancedClinicalAnalyticsEngine:
                         chronological_stream_attributions["categorical_result"][seq_idx] += cat_stream[seq_idx]
                         chronological_stream_attributions["timestamp"][seq_idx] += time_stream[seq_idx]
                 except Exception as e:
-                    pass
+                    print(f"⚠️ [XAI ATTR WARNING] Batch {batch_idx} sample attribution failed: {e}")
 
             processed_samples += f_ids_b.size(0)
             
@@ -360,7 +371,6 @@ class AdvancedClinicalAnalyticsEngine:
 
         manifold_diag = compute_comprehensive_manifold_diagnostics(z_mean_pooled)
 
-        # 🚀 RESTORED CONSOLE PRINTS FOR LATENT DIAGNOSTICS
         print(f"\n📊 COHORT LATENT QUANTIZATION METRICS:")
         print(f"  • Manifold Effective Rank: {manifold_diag['effective_rank']:.2f} / {self.cfg.latent_dim}")
         print(f"  • Layer Representation Sparsity Index: {manifold_diag['sparsity_index']:.4f}")
@@ -384,50 +394,142 @@ class AdvancedClinicalAnalyticsEngine:
     def _render_all_exports(self, z_slots, z_flat, z_pooled, y_cohort, blueprint, timeline_data, mean_attn, cf_deltas, eff_rank, global_severity_scores):
         print("\n🖼️ Compiling presentation graphics to disk...")
 
-        # 1. Timeline Stackplot
-        seq_len = len(timeline_data["feature_id"])
+        # 🚀 1. Dynamic Cohort Active Sequence Horizon Detection
+        non_zero_indices = np.where(timeline_data["feature_id"] > 0)[0]
+        if len(non_zero_indices) > 0:
+            max_active_len = int(np.max(non_zero_indices)) + 1
+        else:
+            max_active_len = 50
+        
+        max_active_len = max(30, min(self.cfg.max_sequence_len, max_active_len + 5))
+        print(f"🔍 [XAI ZOOM] Active clinical timeline window: 0 .. {max_active_len - 1} steps")
+
+        # --- A. Timeline Stackplot ---
+        x_axis = np.arange(max_active_len)
+        feat_stream = timeline_data["feature_id"][:max_active_len]
+        num_stream  = timeline_data["numeric_value"][:max_active_len]
+        cat_stream  = timeline_data["categorical_result"][:max_active_len]
+        time_stream = timeline_data["timestamp"][:max_active_len]
+
         plt.figure(figsize=(11, 5.5), dpi=300)
         plt.stackplot(
-            np.arange(seq_len), timeline_data["feature_id"], timeline_data["numeric_value"],
-            timeline_data["categorical_result"], timeline_data["timestamp"],
-            colors=["#8e44ad", "#3498db", "#2ecc71", "#f1c40f"], alpha=0.8
+            x_axis, 
+            feat_stream, 
+            num_stream,
+            cat_stream, 
+            time_stream,
+            labels=["Feature ID", "Numeric Value", "Categorical Result (BPE)", "Timestamp Delta"],
+            colors=["#8e44ad", "#3498db", "#2ecc71", "#f1c40f"], 
+            alpha=0.8
         )
         plt.title("Cohort-Mean Integrated Gradients Attribution Across Timeline Sequence Positions", fontsize=12, fontweight='bold', pad=12)
+        plt.xlabel("Sequence Position (Chronological Timeline Step)", fontsize=10, labelpad=8)
+        plt.ylabel("Attribution Mass", fontsize=10, labelpad=8)
+        plt.xlim([0, max_active_len - 1])
+        plt.legend(loc="upper right", frameon=True, facecolor="white", edgecolor="none", fontsize=10)
         plt.tight_layout()
         plt.savefig(os.path.join(self.cfg.xai_export_dir, "clinical_feature_importance.png"), dpi=300)
         plt.close()
 
-        # 2. Attention Matrix
-        plt.figure(figsize=(10.5, 10.5), dpi=300) 
-        sns.heatmap(mean_attn, cmap="crest", vmin=0.15, vmax=1.0)
-        plt.title("Cohort-Mean Layer 0 Token-to-Token Attention Routing Matrix", fontsize=12, fontweight='bold', pad=14)
+        # 🚀 --- B. Attention Matrix (Inverted High-Contrast Colormap) ---
+        active_attn = mean_attn[:max_active_len, :max_active_len]
+        plt.figure(figsize=(10.5, 10.5), dpi=300)
+        
+        # Compute dynamic upper color limit for active non-zero attention cells
+        non_zero_vals = active_attn[active_attn > 0]
+        if len(non_zero_vals) > 0:
+            vmax_target = float(np.percentile(non_zero_vals, 98))
+        else:
+            vmax_target = float(np.max(active_attn)) if np.max(active_attn) > 0 else 1.0
+        vmax_target = max(vmax_target, 0.05)
+
+        step_interval = max(1, max_active_len // 10)
+        
+        # 🚀 Using 'rocket_r' (inverted): background/0.0 is off-white, active attention is dark red/purple
+        sns.heatmap(
+            active_attn, 
+            cmap="rocket_r", 
+            vmin=0.0, 
+            vmax=vmax_target,
+            cbar_kws={'label': 'Attention Routing Strength'},
+            xticklabels=step_interval,
+            yticklabels=step_interval
+        )
+        plt.title(f"Cohort-Mean Layer 0 Token-to-Token Attention Routing Matrix [Active Horizon: {max_active_len} Tokens]", fontsize=12, fontweight='bold', pad=14)
+        plt.xlabel("Key Sequence Position", fontsize=10, labelpad=8)
+        plt.ylabel("Query Sequence Position", fontsize=10, labelpad=8)
         plt.tight_layout()
         plt.savefig(os.path.join(self.cfg.xai_export_dir, "high_res_attention_routing.png"), dpi=300)
         plt.close()
 
-        # 3. Smooth Arch UMAP Manifold
+        # --- C. 2D & 🚀 3D UMAP Latent Patient Topology ---
         if z_slots.ndim == 3 and z_slots.shape[1] >= self.cfg.num_slots:
             z_pure = z_slots[:, :self.cfg.num_slots, :].mean(dim=1)
         else:
             z_pure = z_pooled if torch.is_tensor(z_pooled) else torch.tensor(z_pooled)
 
         z_norm = F.normalize(z_pure.float(), p=2, dim=-1).cpu().numpy()
-        p_reducer = umap.UMAP(
+        
+        # 1) 2D UMAP Static Image
+        p_reducer_2d = umap.UMAP(
             n_neighbors=self.cfg.xai_umap_n_neighbors, min_dist=self.cfg.xai_umap_min_dist, 
             n_components=2, metric=self.cfg.xai_umap_metric, random_state=self.cfg.random_seed
         )
-        p_umap = p_reducer.fit_transform(z_norm)
-        df_p = pd.DataFrame({'UMAP 1': p_umap[:, 0], 'UMAP 2': p_umap[:, 1], 'Global Severity Load': np.array(global_severity_scores)[:len(p_umap)]})
+        p_umap_2d = p_reducer_2d.fit_transform(z_norm)
+        df_p_2d = pd.DataFrame({
+            'UMAP 1': p_umap_2d[:, 0], 
+            'UMAP 2': p_umap_2d[:, 1], 
+            'Global Severity Load': np.array(global_severity_scores)[:len(p_umap_2d)]
+        })
 
         plt.figure(figsize=(10, 8), dpi=300)
-        sc = plt.scatter(data=df_p, x='UMAP 1', y='UMAP 2', c='Global Severity Load', cmap='turbo', s=28, alpha=0.65)
+        sc = plt.scatter(data=df_p_2d, x='UMAP 1', y='UMAP 2', c='Global Severity Load', cmap='turbo', s=28, alpha=0.65)
         plt.colorbar(sc, pad=0.02).set_label("Joint Clinical Intensity Index (Expected Load Count)")
-        plt.title("T-JEPA Latent Patient Topology mapped to Global Severity Load", fontsize=12, fontweight='bold', pad=12)
+        plt.title("T-JEPA Latent Patient Topology mapped to Global Severity Load (2D)", fontsize=12, fontweight='bold', pad=12)
         plt.tight_layout()
         plt.savefig(os.path.join(self.cfg.xai_export_dir, "global_patient_manifold.png"), dpi=300)
         plt.close()
 
-        # 4. Counterfactual Spectrum
+        # 🚀 2) 3D UMAP Interactive HTML Export
+        try:
+            p_reducer_3d = umap.UMAP(
+                n_neighbors=self.cfg.xai_umap_n_neighbors, min_dist=self.cfg.xai_umap_min_dist, 
+                n_components=3, metric=self.cfg.xai_umap_metric, random_state=self.cfg.random_seed
+            )
+            p_umap_3d = p_reducer_3d.fit_transform(z_norm)
+            
+            import plotly.express as px
+            df_3d = pd.DataFrame({
+                'UMAP Axis 1': p_umap_3d[:, 0],
+                'UMAP Axis 2': p_umap_3d[:, 1],
+                'UMAP Axis 3': p_umap_3d[:, 2],
+                'Global Severity Load': np.array(global_severity_scores)[:len(p_umap_3d)]
+            })
+            fig_3d = px.scatter_3d(
+                df_3d, 
+                x='UMAP Axis 1', 
+                y='UMAP Axis 2', 
+                z='UMAP Axis 3',
+                color='Global Severity Load',
+                color_continuous_scale='turbo',
+                opacity=0.75,
+                title="T-JEPA 3D Latent Patient Topology Mapped to Global Severity Load"
+            )
+            fig_3d.update_traces(marker=dict(size=3))
+            fig_3d.update_layout(
+                scene=dict(
+                    xaxis_title='UMAP Axis 1',
+                    yaxis_title='UMAP Axis 2',
+                    zaxis_title='UMAP Axis 3'
+                )
+            )
+            html_out_path = os.path.join(self.cfg.xai_export_dir, "global_patient_manifold_3d.html")
+            fig_3d.write_html(html_out_path)
+            print(f"🌐 [3D UMAP EXPORT] Saved interactive 3D manifold to -> {html_out_path}")
+        except Exception as e:
+            print(f"⚠️ [3D UMAP WARNING] Interactive Plotly HTML generation skipped: {e}")
+
+        # --- D. Counterfactual Spectrum ---
         plt.figure(figsize=(10, 4.8), dpi=300)
         sns.histplot(np.clip(np.array(cf_deltas).flatten(), -100.0, 100.0), kde=True, color="#e74c3c", alpha=0.6, bins=40)
         plt.axvline(x=0.0, color='black', linestyle='--')
@@ -436,7 +538,7 @@ class AdvancedClinicalAnalyticsEngine:
         plt.savefig(os.path.join(self.cfg.xai_export_dir, "population_counterfactual_spectrum.png"), dpi=300)
         plt.close()
 
-        # 5. Latent Blueprint
+        # --- E. Latent Blueprint ---
         plt.figure(figsize=(10, 4.2), dpi=300)
         sns.heatmap(blueprint, cmap="vlag", center=0)
         plt.title(f"Empirical Latent Activation Matrix [{blueprint.shape[0]} slots, 512 channels] (Centered Rank: {eff_rank:.2f})", fontweight='bold')
@@ -444,7 +546,6 @@ class AdvancedClinicalAnalyticsEngine:
         plt.savefig(os.path.join(self.cfg.xai_export_dir, "probe_blueprint.png"), dpi=300)
         plt.close()
         
-        # 🚀 RESTORED COHORT SUMMARY PRINT
         cohort_prevalence = (y_cohort.sum() / y_cohort.size) * 100
         print(f"\n🎉 Analytical evaluation complete! Cohort overall target density: {cohort_prevalence:.3f}%")
         print(f"🚀 Saved exports to -> {self.cfg.xai_export_dir}")

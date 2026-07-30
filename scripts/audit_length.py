@@ -53,9 +53,8 @@ if __name__ == "__main__":
         for _, c_row in p_cdha.iterrows():
             tech = str(c_row.get('kythuatcdha', '')).strip().lower()
             if tech:
-                text = str(c_row.get('ketluan', ''))
-                words = clean_and_tokenize_text(text, stop_words=cfg.clinical_stop_words)
-                raw_events_count += len(words) if words else 1
+                # 🚀 FIXED: In 3D BPE Hierarchical framework, 1 imaging report = exactly 1 timeline step
+                raw_events_count += 1
 
         untruncated_sequence_lengths.append(raw_events_count)
 
