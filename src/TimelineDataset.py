@@ -96,6 +96,7 @@ class BVTDFlattenedDataset(Dataset):
         if cutoff == 0:
             student_mask = base_mask.clone()
             teacher_mask = base_mask.clone()
+            dt_target = torch.tensor(0.0, dtype=torch.float32)
         else:
             # Strictly mask the target horizon block [target_start : active_len] at the tail
             target_start = max(1, cutoff - k_sample + 1)
@@ -109,6 +110,9 @@ class BVTDFlattenedDataset(Dataset):
             teacher_mask = torch.ones(self.max_seq_len, dtype=torch.bool)
             teacher_mask[target_start:target_end] = base_mask[target_start:target_end]
 
+            # 🚀 Compute physical time delta (hours) across the target horizon block
+            dt_target = times[target_start] - times[cutoff]
+
         icd_ids, tgt_mask = self._parse_1d_sequence(row['icd_targets'], int, 0, self.max_targets)
 
         return {
@@ -120,6 +124,7 @@ class BVTDFlattenedDataset(Dataset):
             'base_mask': base_mask,                   # Shape: [max_seq_len] (BoolTensor)
             'student_mask': student_mask,             # Shape: [max_seq_len] (BoolTensor)
             'teacher_mask': teacher_mask,             # Shape: [max_seq_len] (BoolTensor)
+            'dt_target': dt_target,
             'age': age_tensor,                        # Shape: [] Scalar (FloatTensor)
             'gender': gender_tensor,                  # Shape: [] Scalar (LongTensor)
             'icd_targets': icd_ids,                   # Shape: [max_targets] (LongTensor)

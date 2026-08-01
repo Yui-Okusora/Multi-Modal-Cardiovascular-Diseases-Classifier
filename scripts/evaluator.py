@@ -196,6 +196,7 @@ class CleanReadonlyEvaluator:
         pipeline.load_checkpoint(checkpoint_path)
                 
         pipeline.context_encoder.eval()
+        if pipeline.hopfield is not None: pipeline.hopfield.eval()
         if pipeline.probe is not None: pipeline.probe.eval()
         if pipeline.cardinal is not None: pipeline.cardinal.eval()
         
@@ -212,13 +213,15 @@ class CleanReadonlyEvaluator:
         flat_thresholds = np.ones(pipeline.num_icd_classes) * self.cfg.eval_flat_threshold
         execute_clinical_audit(
             targets, probs, predicted_cardinalities=pred_cards, 
-            thresholds=flat_thresholds, calibrate_per_class=False, temp_alpha=self.cfg.eval_temp_alpha
+            thresholds=flat_thresholds, calibrate_per_class=False, temp_alpha=self.cfg.eval_temp_alpha,
+            calibration_beta=self.cfg.calibration_beta
         )
         
         print("\n🌀 Running Built-In Clinical Safety Auto-Calibration (with Auxiliary Cardinality)...")
         clinical_audit = execute_clinical_audit(
             targets, probs, predicted_cardinalities=pred_cards, 
-            thresholds=None, calibrate_per_class=True, temp_alpha=self.cfg.eval_temp_alpha
+            thresholds=None, calibrate_per_class=True, temp_alpha=self.cfg.eval_temp_alpha,
+            calibration_beta=self.cfg.calibration_beta
         )
         calibrated_thresholds = clinical_audit["calibrated_thresholds"]
         

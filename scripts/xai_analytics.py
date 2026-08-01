@@ -81,6 +81,7 @@ class AdvancedClinicalAnalyticsEngine:
         tgt_enc   = getattr(pipeline, 'target_encoder', None)
         predictor = getattr(pipeline, 'predictor', None)
         assembler = getattr(pipeline, 'assembler', None)
+        hopfield  = getattr(pipeline, 'hopfield', None)
         projector = getattr(pipeline, 'context_projector', None)
         probe     = getattr(pipeline, 'probe', None)       
         cardinal  = getattr(pipeline, 'cardinal', None)    
@@ -99,6 +100,7 @@ class AdvancedClinicalAnalyticsEngine:
             "Predictor Network": predictor,
             "Manifold Assembler": assembler,
             "Projector Layer": projector,
+            "Hopfield Memory": hopfield,
             "Label Probe": probe,
             "Cardinality Head": cardinal
         }
@@ -266,6 +268,7 @@ class AdvancedClinicalAnalyticsEngine:
                 'timestamps': t, 
                 'base_mask': s_mask,
                 'student_mask': s_mask,
+                'dt_target': torch.zeros(curr_b, dtype=torch.float32, device=f.device),
                 'age': age, 
                 'gender': gender,
                 'icd_targets': torch.zeros(curr_b, 1, dtype=torch.long, device=f.device),
@@ -379,6 +382,10 @@ class AdvancedClinicalAnalyticsEngine:
         actual_latent_matrix = z_slots.mean(dim=0).numpy()  
         mean_attn_map = self.compute_cohort_attention_routing_matrix(pipeline)
 
+        if pipeline.hopfield is not None:
+            hopfield_path = os.path.join(self.cfg.xai_export_dir, "probe_multi_basin_hopfield_energy.png")
+            self.plot_multi_basin_hopfield_energy(pipeline.hopfield, output_path=hopfield_path)
+
         self._render_all_exports(
             z_slots=z_slots, z_flat=z_flattened.numpy(), z_pooled=z_mean_pooled, 
             y_cohort=y_cohort, blueprint=actual_latent_matrix, 
@@ -386,10 +393,6 @@ class AdvancedClinicalAnalyticsEngine:
             cf_deltas=cohort_counterfactual_deltas, eff_rank=manifold_diag["effective_rank"], 
             global_severity_scores=cohort_global_severity_scores
         )
-
-        if pipeline.probe is not None:
-            hopfield_path = os.path.join(self.cfg.xai_export_dir, "probe_multi_basin_hopfield_energy.png")
-            self.plot_multi_basin_hopfield_energy(pipeline.probe, output_path=hopfield_path)
 
     def _render_all_exports(self, z_slots, z_flat, z_pooled, y_cohort, blueprint, timeline_data, mean_attn, cf_deltas, eff_rank, global_severity_scores):
         print("\n🖼️ Compiling presentation graphics to disk...")
@@ -463,12 +466,7 @@ class AdvancedClinicalAnalyticsEngine:
         plt.close()
 
         # --- C. 2D & 🚀 3D UMAP Latent Patient Topology ---
-        if z_slots.ndim == 3 and z_slots.shape[1] >= self.cfg.num_slots:
-            z_pure = z_slots[:, :self.cfg.num_slots, :].mean(dim=1)
-        else:
-            z_pure = z_pooled if torch.is_tensor(z_pooled) else torch.tensor(z_pooled)
-
-        z_norm = F.normalize(z_pure.float(), p=2, dim=-1).cpu().numpy()
+        z_norm = F.normalize(torch.tensor(z_flat).float(), p=2, dim=-1).cpu().numpy()
         
         # 1) 2D UMAP Static Image
         p_reducer_2d = umap.UMAP(

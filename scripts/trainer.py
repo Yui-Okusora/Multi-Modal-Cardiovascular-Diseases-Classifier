@@ -168,6 +168,7 @@ class DualPhaseTrainingEngine(BaseExecutionEngine):
                 np.concatenate(all_probs, axis=0), 
                 predicted_cardinalities=np.concatenate(all_pred_counts, axis=0), 
                 temp_alpha=self.cfg.eval_temp_alpha,
+                calibration_beta=self.cfg.calibration_beta,
                 silent=True
             )
 
@@ -313,24 +314,53 @@ class DualPhaseTrainingEngine(BaseExecutionEngine):
             param.requires_grad = False
 
         self.pipeline.inject_phase2_infrastructure()
+        self.hopfield_module = self.pipeline.hopfield
         self.probe_module = self.pipeline.probe
         self.cardinal_module = self.pipeline.cardinal
 
+        if self.hopfield_module is not None:
+            self.hopfield_module.train()
         self.probe_module.train()
         self.cardinal_module.train()
         self.assembler.train()
 
-        backbone_lora_params = [p for p in self.context_encoder.parameters() if p.requires_grad]
-        assembler_params     = [p for p in self.assembler.parameters() if p.requires_grad]
-        probe_params         = [p for p in self.probe_module.parameters() if p.requires_grad]
-        cardinal_params      = [p for p in self.cardinal_module.parameters() if p.requires_grad]
+        def isolate_decay_params(module):
+            decay, no_decay = [], []
+            for name, p in module.named_parameters():
+                if not p.requires_grad: continue
+                # Isolate Biases, LayerNorms, and Custom Scalars from L2 Decay
+                if p.dim() < 2 or any(k in name.lower() for k in ['bias', 'norm', 'temp', 'beta', 'gate']):
+                    no_decay.append(p)
+                else:
+                    decay.append(p)
+            return decay, no_decay
+
+        lora_decay, lora_no_decay = isolate_decay_params(self.context_encoder)
+        assembler_decay, assembler_no_decay = isolate_decay_params(self.assembler)
+        probe_decay, probe_no_decay = isolate_decay_params(self.probe_module)
+        card_decay, card_no_decay = isolate_decay_params(self.cardinal_module)
 
         optimized_parameters = [
-            {"params": backbone_lora_params, "lr": self.cfg.probe_lr * self.cfg.probe_lr_backbone_scale,  "weight_decay": 1e-2},
-            {"params": assembler_params,     "lr": self.cfg.probe_lr * self.cfg.probe_lr_assembler_scale, "weight_decay": self.cfg.probe_wgt_decay},
-            {"params": probe_params,         "lr": self.cfg.probe_lr,                                      "weight_decay": self.cfg.probe_wgt_decay},
-            {"params": cardinal_params,      "lr": self.cfg.probe_lr,                                      "weight_decay": self.cfg.probe_wgt_decay}
+            {"params": lora_decay,       "lr": self.cfg.probe_lr * self.cfg.probe_lr_backbone_scale,  "weight_decay": self.cfg.probe_wgt_decay},
+            {"params": lora_no_decay,    "lr": self.cfg.probe_lr * self.cfg.probe_lr_backbone_scale,  "weight_decay": 0.0},
+            
+            {"params": assembler_decay,  "lr": self.cfg.probe_lr * self.cfg.probe_lr_assembler_scale, "weight_decay": 0.0},
+            {"params": assembler_no_decay,"lr": self.cfg.probe_lr * self.cfg.probe_lr_assembler_scale,"weight_decay": 0.0},
+            
+            {"params": probe_decay,      "lr": self.cfg.probe_lr,                                     "weight_decay": self.cfg.probe_wgt_decay},
+            {"params": probe_no_decay,   "lr": self.cfg.probe_lr,                                     "weight_decay": 0.0},
+            
+            {"params": card_decay,       "lr": self.cfg.probe_lr,                                     "weight_decay": self.cfg.probe_wgt_decay},
+            {"params": card_no_decay,    "lr": self.cfg.probe_lr,                                     "weight_decay": 0.0}
         ]
+
+        if self.hopfield_module is not None:
+            hopfield_decay, hopfield_no_decay = isolate_decay_params(self.hopfield_module)
+            optimized_parameters.extend([
+                {"params": hopfield_decay,    "lr": self.cfg.probe_lr, "weight_decay": self.cfg.probe_wgt_decay},
+                {"params": hopfield_no_decay, "lr": self.cfg.probe_lr, "weight_decay": 0.0}
+            ])
+
         p2_optimizer = torch.optim.AdamW(optimized_parameters)
 
         total_steps = len(train_loader) * self.cfg.probe_epochs
@@ -340,11 +370,10 @@ class DualPhaseTrainingEngine(BaseExecutionEngine):
         )
 
         criterion_cls = ClassAwareASL(
-            class_frequencies=self.frequencies,
+            gamma_neg=self.cfg.asl_gamma_neg,
             gamma_pos=self.cfg.asl_gamma_pos,
-            gamma_neg_base=self.cfg.asl_gamma_neg_base,
-            beta_neg_base=self.cfg.asl_beta_neg_base,
-            delta_beta=self.cfg.asl_delta_beta
+            clip=self.cfg.asl_clip,
+            eps=self.cfg.asl_eps
         ).to(self.cfg.device)
         criterion_reg = nn.MSELoss()
 
@@ -354,15 +383,21 @@ class DualPhaseTrainingEngine(BaseExecutionEngine):
             cls_loss = criterion_cls(out['logits'], out['multi_hot_targets'])
             card_loss = criterion_reg(out['predicted_cardinalities'].view(-1), out['true_cardinalities'].view(-1))
             
+            # 🚀 Prototype loss now explicitly targets the decoupled hopfield_module
             proto_loss = torch.tensor(0.0, device=self.device)
-            if hasattr(self.probe_module, 'prototype_memory') and hasattr(self.probe_module, 'k_proj'):
-                K_proto = self.probe_module.k_proj(self.probe_module.prototype_memory)
+            if self.hopfield_module is not None:
+                K_proto = self.hopfield_module.k_proj(self.hopfield_module.prototype_memory)
                 K_norm = F.normalize(K_proto, p=2, dim=-1)
                 Gram = K_norm @ K_norm.T
-                I = torch.eye(K_norm.size(0), device=self.device)
-                num_off_diag = Gram.size(0) * (Gram.size(0) - 1)
-                proto_loss = (((Gram - I) ** 2).sum() / num_off_diag) * self.cfg.proto_loss_scale
+                
+                M = Gram.size(0)
+                mask = 1.0 - torch.eye(M, device=self.device)
+                off_diag_gram = Gram * mask
+                
+                violations = torch.relu(off_diag_gram - 0.20).pow(2)
+                proto_loss = violations.sum() / max(1, M * (M - 1))
 
+            # 🚀 Co-occurrence remains correctly tied to the probe_module (will output 0.0 if linear)
             cooccur_loss = torch.tensor(0.0, device=self.device)
             if hasattr(self.probe_module, 'weight_class'):
                 W_norm = F.normalize(self.probe_module.weight_class, p=2, dim=-1)
@@ -498,7 +533,7 @@ if __name__ == "__main__":
     best_ssl_path = os.path.join(cfg.checkpoint_dir, cfg.best_ssl_backbone_filename)
     
     # ─── EXECUTION STAGES ───
-    engine.run_phase1_pretraining(p1_train_loader)
+    #engine.run_phase1_pretraining(p1_train_loader)
     
     engine.run_phase2_probe_fitting(
         p2_train_loader, 

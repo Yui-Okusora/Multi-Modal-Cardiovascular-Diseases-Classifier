@@ -156,82 +156,57 @@ class UnifiedSystemicEmbedder(nn.Module):
         return self.global_token_norm(combined_tokens)
 
 
-# ==================================================================================================
-# 3. PERCEIVER LATENT POOLING MODULE
-# ==================================================================================================
 class PerceiverLatentPooling(nn.Module):
-    """
-    DESCRIPTION:
-    ------------
-    Asymmetric latent bottleneck layer that pools dynamic-length clinical timelines into 
-    a fixed-size latent matrix [B, num_slots, d_model] (typically 24 slots of dimension 512).
-
-    TECHNOLOGY & MATHEMATICAL FOUNDATION:
-    --------------------------------------
-    Based on the Perceiver Architecture (Jaegle et al., 2021):
-      1. Cross-Attention: 24 learned latent query slots query the variable-length sequence [B, L, d_model].
-      2. Latent Self-Attention: Slots communicate among themselves to unmix independent clinical themes.
-      3. Latent Feed-Forward (FFN): Deterministic non-linear coordinate projection.
-    """
-    def __init__(self, num_slots: int, d_model: int, nheads: int = 8):
+    def __init__(self, num_slots: int = 24, d_model: int = 512, nheads: int = 8, self_attn_layers: int = 2):
         super().__init__()
         self.num_slots = num_slots
         self.d_model = d_model
         
-        self.latent_slots = nn.Parameter(torch.empty(num_slots, d_model))
-        self.slot_pos_embeddings = nn.Parameter(torch.empty(num_slots, d_model))
-        self._reset_parameters()
+        # Single parameter matrix for slots
+        self.learned_slots = nn.Parameter(torch.empty(num_slots, d_model))
+        nn.init.orthogonal_(self.learned_slots, gain=1.0)
         
         self.slot_norm = nn.LayerNorm(d_model)
         self.kv_norm = nn.LayerNorm(d_model)
         
         self.cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=nheads, batch_first=True)
-        self.latent_self_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=nheads, batch_first=True)
-        self.self_attn_norm = nn.LayerNorm(d_model)
         
-        self.feed_forward = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, d_model)
+        # Multi-layer self-attention stack with explicit final LayerNorm
+        latent_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nheads, dim_feedforward=d_model * 2,
+            dropout=0.05, activation='gelu', batch_first=True, norm_first=True
         )
-        self.ff_norm = nn.LayerNorm(d_model)
-
-    def _reset_parameters(self):
-        nn.init.orthogonal_(self.latent_slots, gain=1.0)
-        nn.init.orthogonal_(self.slot_pos_embeddings, gain=0.1)
+        # 🚀 Fix 4: Pass final_norm to TransformerEncoder so output is normalized
+        final_norm = nn.LayerNorm(d_model)
+        self.slot_mixer = nn.TransformerEncoder(latent_layer, num_layers=self_attn_layers, norm=final_norm)
 
     def forward(self, x: torch.Tensor, padding_mask: torch.Tensor = None) -> torch.Tensor:
         batch_size = x.size(0)
-        ordered_slots = self.latent_slots + self.slot_pos_embeddings
-        norm_slots = self.slot_norm(ordered_slots).unsqueeze(0).expand(batch_size, -1, -1)
+        
+        norm_slots = self.slot_norm(self.learned_slots).unsqueeze(0).expand(batch_size, -1, -1)
         norm_x = self.kv_norm(x)
         
+        # Robust padding mask handling
         if padding_mask is not None:
             all_padded_rows = padding_mask.all(dim=-1, keepdim=True)
             padding_mask = padding_mask.masked_fill(all_padded_rows, False)
 
+        # Cross-Attention: Compress sequence length L -> 24 slots
         attn_out, _ = self.cross_attn(
             query=norm_slots, key=norm_x, value=norm_x, key_padding_mask=padding_mask
         )
         slots = norm_slots + attn_out
         
-        norm_slots_self = self.self_attn_norm(slots)
-        self_attn_out, _ = self.latent_self_attn(
-            query=norm_slots_self, key=norm_slots_self, value=norm_slots_self
-        )
-        slots = slots + self_attn_out
-        slots = slots + self.feed_forward(self.ff_norm(slots))
-        return slots
+        # Deep Latent Slot Mixing
+        return self.slot_mixer(slots)
 
 
 # ==================================================================================================
-# 4. CONTEXT ENCODER (STUDENT STREAM)
+# 4. OPTIMIZED CONTEXT ENCODER (STUDENT STREAM)
 # ==================================================================================================
 class ContextEncoder(nn.Module):
-    r"""
-    DESCRIPTION:
-    ------------
-    The deep sequential backbone of the JEPA student stream processing sliding event windows.
+    """
+    Streamlined Context Encoder with $L_2$ Hypersphere Output Projection.
     """
     def __init__(
         self, 
@@ -243,15 +218,19 @@ class ContextEncoder(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
+        
         self.tokenizer = UnifiedSystemicEmbedder(num_total_features, num_cat_results, d_model)
         
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=8, dim_feedforward=d_model * 4, 
-            batch_first=True, activation='gelu', norm_first=True
+            d_model=d_model, 
+            nhead=8, 
+            dim_feedforward=d_model * 4, 
+            batch_first=True, 
+            activation='gelu', 
+            norm_first=True
         )
         self.temporal_backbone = nn.TransformerEncoder(encoder_layer, num_layers=nlayers)
-        self.perceiver_pool = PerceiverLatentPooling(num_slots=num_slots, d_model=d_model)
-        self.output_norm = nn.LayerNorm(d_model)
+        self.perceiver_pool = PerceiverLatentPooling(num_slots=num_slots, d_model=d_model, self_attn_layers=2)
 
     def forward(
         self, 
@@ -264,9 +243,9 @@ class ContextEncoder(nn.Module):
         x_events = self.tokenizer(feature_ids, numeric_values, cat_result_ids, timestamps)
         h_seq = self.temporal_backbone(x_events, src_key_padding_mask=padding_mask)
         z_c = self.perceiver_pool(h_seq, padding_mask=padding_mask)
-        z_c_stable = self.output_norm(z_c)
-        z_c_normalized = F.normalize(z_c_stable, p=2, dim=-1) * math.sqrt(self.d_model)
-        return z_c_normalized
+        
+        # L2 Hypersphere Projection (Scale = sqrt(d_model))
+        return F.normalize(z_c, p=2, dim=-1) * math.sqrt(self.d_model)
 
 
 TargetEncoder = ContextEncoder
@@ -276,26 +255,67 @@ TargetEncoder = ContextEncoder
 # 5. WORLD-MODEL PREDICTOR
 # ==================================================================================================
 class Predictor(nn.Module):
-    def __init__(self, num_slots: int = 24, d_model: int = 512, nhead: int = 8, num_layers: int = 3):
+    """
+    Cross-Attention World-Model Predictor:
+    1. Internal learned target queries (Q) attend to past latents (K, V).
+    2. Lightweight inter-slot self-attention pass allows predicted slots to unmix.
+    3. L2 Hypersphere projection at exit matches TargetEncoder metric space.
+    """
+    def __init__(self, num_slots: int = 24, d_model: int = 512, nhead: int = 8):
         super().__init__()
-        self.channel_mlp = nn.Sequential(
+        self.num_future_slots = num_slots
+        self.d_model = d_model
+        
+        # Target queries owned internally as learned parameters
+        self.target_queries = nn.Parameter(torch.empty(num_slots, d_model))
+        nn.init.orthogonal_(self.target_queries, gain=1.0)
+        
+        # Pre-LN Cross Attention
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=nhead, batch_first=True)
+        
+        # 🚀 Fix 2: Lightweight Inter-Slot Self-Attention block so predicted slots can coordinate
+        self.self_attn_norm = nn.LayerNorm(d_model)
+        self.slot_self_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=nhead, batch_first=True)
+        
+        # Feed-Forward Block
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model * 2),
             nn.GELU(),
-            nn.Linear(d_model * 2, d_model),
-            nn.LayerNorm(d_model)
+            nn.Linear(d_model * 2, d_model)
         )
-        # 🚀 Deeper predictor (3 layers) prevents backbone over-specialization
-        predictor_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=d_model * 2,
-            dropout=0.10, activation=F.gelu, batch_first=True, norm_first=True
-        )
-        self.slot_mixer = nn.TransformerEncoder(predictor_layer, num_layers=num_layers)
-        self.final_norm = nn.LayerNorm(d_model)
 
-    def forward(self, z_c: torch.Tensor) -> torch.Tensor:
-        z_predicted = self.channel_mlp(z_c)
-        z_out = self.slot_mixer(z_predicted)
-        return self.final_norm(z_predicted + z_out)
+    def forward(self, z_past: torch.Tensor, future_time_emb: torch.Tensor = None) -> torch.Tensor:
+        batch_size = z_past.size(0)
+        
+        # Expand internal target queries across the batch: [B, 24, 512]
+        q = self.target_queries.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # 🚀 Fix 3: Robust shape broadcast guard for 2D vs 3D future_time_emb
+        if future_time_emb is not None:
+            if future_time_emb.dim() == 2:
+                future_time_emb = future_time_emb.unsqueeze(1)
+            q = q + future_time_emb
+            
+        norm_q = self.norm_q(q)
+        norm_kv = self.norm_kv(z_past)
+        
+        # 1. Cross-Attend: Target Queries (Q) look up Past Context (K, V)
+        cross_out, _ = self.cross_attn(query=norm_q, key=norm_kv, value=norm_kv)
+        h_cross = q + cross_out
+        
+        # 2. Inter-Slot Self-Attention: Allow predicted future slots to unmix
+        norm_h = self.self_attn_norm(h_cross)
+        self_out, _ = self.slot_self_attn(query=norm_h, key=norm_h, value=norm_h)
+        h_self = h_cross + self_out
+        
+        # 3. FFN Refinement
+        z_hat_raw = h_self + self.ffn(h_self)
+        
+        # 🚀 Fix 1: Matching L2 Hypersphere Projection (Scale = sqrt(d_model))
+        return F.normalize(z_hat_raw, p=2, dim=-1) * math.sqrt(self.d_model)
 
 
 # ==================================================================================================
@@ -303,35 +323,38 @@ class Predictor(nn.Module):
 # ==================================================================================================
 class PatientManifoldAssembler(nn.Module):
     """
-    DESCRIPTION:
-    ------------
-    Stitches static patient covariates (Age, Gender) onto dynamic clinical timeline slots to 
-    construct the complete **26-token Patient State Manifold**.
+    Optimized Patient Manifold Assembler:
+    1. Direct L2 projection without redundant LayerNorm pre-scaling.
+    2. Compact embedding table for gender (4 slots instead of BPE vocab size).
+    3. Robust shape formatting for age and gender inputs.
     """
-    def __init__(self, num_cat_results: int, latent_dim: int = 512, covariate_scale: float = 0.50):
+    def __init__(self, num_cat_results: int, num_gender_cats: int = 4, latent_dim: int = 512, covariate_scale: float = 0.50):
         super().__init__()
         self.latent_dim = latent_dim
 
-        self.raw_covariate_scale = nn.Parameter(torch.tensor(0.0))
+        covariate_scale = max(0.01, min(0.99, covariate_scale))
+        raw_init = math.log(covariate_scale / (1.0 - covariate_scale))
+        self.raw_covariate_scale = nn.Parameter(torch.tensor(raw_init))
         
         self.age_projector = nn.Linear(in_features=1, out_features=latent_dim)
-        self.gender_embed = nn.Embedding(num_embeddings=num_cat_results, embedding_dim=latent_dim)
-        
-        self.age_norm = nn.LayerNorm(latent_dim)
-        self.gender_norm = nn.LayerNorm(latent_dim)
+        # 🚀 Fix: Compact embedding table for categorical demographic features
+        self.gender_embed = nn.Embedding(num_embeddings=num_gender_cats, embedding_dim=latent_dim)
 
     @property
     def covariate_scale(self) -> torch.Tensor:
-        # 🛡️ Bounded safely in (0.0, 1.0)
         return torch.sigmoid(self.raw_covariate_scale)
 
     def forward(self, z_c_raw: torch.Tensor, age: torch.Tensor, gender: torch.Tensor) -> torch.Tensor:
-        z_age = self.age_norm(self.age_projector(age.unsqueeze(-1))).unsqueeze(1)
-        z_gender = self.gender_norm(self.gender_embed(gender)).unsqueeze(1)
+        age_2d = age.view(-1, 1).float()
+        gender_1d = gender.view(-1).long()
+
+        z_age = self.age_projector(age_2d).unsqueeze(1)
+        z_gender = self.gender_embed(gender_1d).unsqueeze(1)
         
         scale = math.sqrt(self.latent_dim)
-        c_scale = self.covariate_scale  # Dynamic learnable scaler
+        c_scale = self.covariate_scale
         
+        # 🚀 Fix: Clean direct L2 normalization without redundant LayerNorm
         z_age = F.normalize(z_age, p=2, dim=-1) * (scale * c_scale)
         z_gender = F.normalize(z_gender, p=2, dim=-1) * (scale * c_scale)
         
@@ -359,31 +382,19 @@ class LinearProbeHead(nn.Module):
 
 
 # ==================================================================================================
-# 8. LABEL-ATTENTIVE SLOT PROBE (LAAT + MODERN HOPFIELD)
+# 8A. CONTINUOUS HOPFIELD ARCHETYPE INJECTOR
 # ==================================================================================================
-class LabelAttentiveSlotProbe(nn.Module):
+class ContinuousHopfieldMemory(nn.Module):
     r"""
-    DESCRIPTION:
-    ------------
-    Advanced Label-Attentive Probe Head (LAAT-inspired) integrated with a Multi-Head 
-    Continuous Modern Hopfield Associative Memory layer based on Ramsauer et al. (2020).
+    Standalone Associative Memory layer. Retrieves textbook clinical archetypes 
+    and overlays them onto the patient's latent slots for noise-cancellation.
     """
-    def __init__(
-        self, 
-        in_slots: int = 26, 
-        in_dim: int = 512, 
-        num_classes: int = 456, 
-        num_prototypes: int = 64,
-        num_hopfield_heads: int = 8,
-        dropout_p: float = 0.20
-    ):
+    def __init__(self, in_dim: int = 512, num_prototypes: int = 128, num_heads: int = 8):
         super().__init__()
-        self.in_slots = in_slots
         self.in_dim = in_dim
-        self.num_classes = num_classes
         self.num_prototypes = num_prototypes
-        self.num_heads = num_hopfield_heads
-        self.head_dim = in_dim // num_hopfield_heads
+        self.num_heads = num_heads
+        self.head_dim = in_dim // num_heads
 
         self.prototype_memory = nn.Parameter(torch.empty(num_prototypes, in_dim))
         
@@ -392,33 +403,22 @@ class LabelAttentiveSlotProbe(nn.Module):
         self.v_proj = nn.Linear(in_dim, in_dim, bias=False)
         self.out_proj = nn.Linear(in_dim, in_dim, bias=False)
 
-        self.hopfield_beta = nn.Parameter(torch.full((num_hopfield_heads, 1, 1), 1.0 / math.sqrt(self.head_dim)))
-        self.hopfield_gate = nn.Parameter(torch.tensor(0.2))
-
-        self.class_embeddings = nn.Parameter(torch.empty(num_classes, in_dim))
-        self.query_proj = nn.Linear(in_dim, in_dim, bias=False)
-        self.weight_class = nn.Parameter(torch.empty(num_classes, in_dim))
-        self.bias_class = nn.Parameter(torch.empty(num_classes))
-        self.class_log_temp = nn.Parameter(torch.full((num_classes, 1, 1), math.log(1.0 / math.sqrt(in_dim))))
-        
+        self.hopfield_beta = nn.Parameter(torch.full((num_heads, 1, 1), math.sqrt(self.head_dim)))
+        self.hopfield_gate = nn.Parameter(torch.tensor(1.0))
         self.slot_norm = nn.LayerNorm(in_dim)
-        self.dropout = nn.Dropout(p=dropout_p)
 
         self._reset_parameters()
 
     def _reset_parameters(self):
         nn.init.xavier_uniform_(self.prototype_memory)
-        nn.init.xavier_uniform_(self.class_embeddings)
-        nn.init.xavier_uniform_(self.weight_class)
-        nn.init.zeros_(self.bias_class)
         nn.init.xavier_uniform_(self.q_proj.weight)
         nn.init.xavier_uniform_(self.k_proj.weight)
         nn.init.xavier_uniform_(self.v_proj.weight)
-        nn.init.zeros_(self.out_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)  # 🚀 Fix preserved: Opens gradient gates instantly
 
-    def forward(self, z_hat_slots: torch.Tensor) -> torch.Tensor:
-        B, L, D = z_hat_slots.shape
-        z_norm = self.slot_norm(z_hat_slots)
+    def forward(self, z_slots: torch.Tensor) -> torch.Tensor:
+        B, L, D = z_slots.shape
+        z_norm = self.slot_norm(z_slots)
         
         Q = self.q_proj(z_norm).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         K = self.k_proj(self.prototype_memory).view(self.num_prototypes, self.num_heads, self.head_dim).transpose(0, 1)
@@ -427,25 +427,54 @@ class LabelAttentiveSlotProbe(nn.Module):
         Q_scaled = F.normalize(Q, p=2, dim=-1)
         K_scaled = F.normalize(K, p=2, dim=-1)
 
-        beta_clamped = torch.clamp(self.hopfield_beta, min=0.1, max=10.0)
+        beta_clamped = torch.clamp(self.hopfield_beta, min=1.0, max=32.0)
         energy_sim = torch.matmul(Q_scaled, K_scaled.transpose(-2, -1)) * beta_clamped
         attn_weights = F.softmax(energy_sim, dim=-1)
         
         retrieved_heads = torch.matmul(attn_weights, V).transpose(1, 2).contiguous().view(B, L, D)
         hopfield_out = self.out_proj(retrieved_heads)
-        z_refined = z_hat_slots + torch.sigmoid(self.hopfield_gate) * hopfield_out
+        
+        return z_slots + torch.sigmoid(self.hopfield_gate) * hopfield_out
 
-        queries = self.query_proj(self.class_embeddings)
-        Q_laat = queries.unsqueeze(0).expand(B, -1, -1)
+
+# ==================================================================================================
+# 8B. LABEL-ATTENTIVE PROBE HEAD (LAAT)
+# ==================================================================================================
+class LabelAttentiveProbe(nn.Module):
+    r"""
+    A switchable decisive probe that uses cross-attention to route specific 
+    physiological slots to specific disease probabilities.
+    """
+    def __init__(self, in_dim: int = 512, num_classes: int = 456, dropout_p: float = 0.20):
+        super().__init__()
+        self.class_queries = nn.Parameter(torch.empty(num_classes, in_dim))
+        self.weight_class = nn.Parameter(torch.empty(num_classes, in_dim))
+        self.bias_class = nn.Parameter(torch.empty(num_classes))
+        
+        # 🚀 Fix preserved: Temperature log initialized to 0.0 for sharp routing
+        self.class_log_temp = nn.Parameter(torch.zeros(num_classes, 1, 1))
+        
+        self.dropout = nn.Dropout(p=dropout_p)
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.class_queries)
+        nn.init.xavier_uniform_(self.weight_class)
+        nn.init.zeros_(self.bias_class)
+
+    def forward(self, z_refined: torch.Tensor) -> torch.Tensor:
+        B, L, D = z_refined.shape
+        Q_laat = self.class_queries.unsqueeze(0).expand(B, -1, -1)
         K_laat, V_laat = z_refined, z_refined
 
-        temp = torch.exp(self.class_log_temp).clamp(min=0.01, max=5.0).view(1, -1, 1)
-        Q_scaled = Q_laat * temp
+        # 🚀 Fix preserved: Clamp up to 10.0 allows dynamic sharpening
+        temp = torch.exp(self.class_log_temp).clamp(min=0.1, max=10.0).view(1, -1, 1)
+        Q_scaled_laat = Q_laat * temp
 
         class_specific_contexts = F.scaled_dot_product_attention(
-            Q_scaled, K_laat, V_laat, attn_mask=None,
+            Q_scaled_laat, K_laat, V_laat, attn_mask=None,
             dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=False, scale=1.0
+            is_causal=False, scale=1.0 / math.sqrt(D)
         )
 
         return torch.sum(class_specific_contexts * self.weight_class.unsqueeze(0), dim=-1) + self.bias_class.unsqueeze(0)
@@ -470,19 +499,19 @@ class AuxiliaryCardinalityHead(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.GELU()
         )
-        self.attention_pool = nn.Linear(hidden_dim, 1, bias=False)
+        self.gate_pool = nn.Linear(hidden_dim, 1)
         self.output_projector = nn.Linear(hidden_dim, 1)
 
     def forward(self, z_hat_slots: torch.Tensor) -> torch.Tensor:
         h_slots = self.slot_net(z_hat_slots)
-        attn_logits = self.attention_pool(h_slots) 
-        attn_weights = F.softmax(attn_logits, dim=1) 
-        pooled_context = torch.sum(h_slots * attn_weights, dim=1)
         
-        # 1. Linear projection from pooled slot context
+        # 🚀 Fix: Additive Sigmoid Gating allows disease count aggregation across active slots
+        gate_weights = torch.sigmoid(self.gate_pool(h_slots))  # [B, 26, 1] in (0, 1)
+        pooled_context = torch.sum(h_slots * gate_weights, dim=1)  # Additive sum
+        
         raw_score = self.output_projector(pooled_context).squeeze(-1)
         
-        # 2. Smooth physical floor: Guarantees output K >= 1.0 with non-zero gradients everywhere
+        # Smooth physical floor: Guarantees output K >= 1.0
         return 1.0 + F.softplus(raw_score)
 
 
@@ -516,39 +545,41 @@ class ClinicalDecoder:
 class ClassAwareASL(nn.Module):
     def __init__(
         self, 
-        class_frequencies: Union[torch.Tensor, np.ndarray, list], 
+        gamma_neg: float = 4.0, 
         gamma_pos: float = 0.0, 
-        gamma_neg_base: float = 4.5, 
-        beta_neg_base: float = 2.5,
-        delta_beta: float = 1.0
+        clip: float = 0.05, 
+        eps: float = 1e-8
     ):
         super().__init__()
-        self.gamma_pos = gamma_pos
-        self.gamma_neg_base = gamma_neg_base
-        self.beta_neg_base = beta_neg_base
-        self.delta_beta = delta_beta
-        
-        if not isinstance(class_frequencies, torch.Tensor):
-            class_frequencies = torch.tensor(class_frequencies, dtype=torch.float32)
-        else:
-            class_frequencies = class_frequencies.float()
-            
-        # Registered as buffer so it moves to CUDA automatically with the module
-        self.register_buffer("class_frequencies", class_frequencies)
+        self.gamma_neg = float(gamma_neg)
+        self.gamma_pos = float(gamma_pos)
+        self.clip = float(clip)
+        self.eps = float(eps)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        probs = torch.sigmoid(logits).float()
-        targets = targets.float()
+        # 1. Compute Probabilities safely
+        p_pos = torch.sigmoid(logits)
+        p_neg = 1.0 - p_pos
+
+        # 2. Asymmetric Probability Shifting (Margin m = clip)
+        if self.clip > 0:
+            p_neg = (p_neg + self.clip).clamp(max=1.0)
+
+        # 3. Compute Focal Weights IN the autograd graph (Crucial for ASL)
+        pt_pos = p_pos * targets
+        pt_neg = p_neg * (1.0 - targets)
         
-        # Class-aware exponents calculated strictly from fixed constants and static frequencies
-        gamma_neg = self.gamma_neg_base + (1.0 - self.class_frequencies) * 2.0
-        beta_neg = self.beta_neg_base + self.delta_beta * (1.0 - self.class_frequencies)
-        
-        loss_pos = targets * torch.log(probs + 1e-7) * (1.0 - probs).pow(self.gamma_pos)
-        loss_neg = (1.0 - targets) * torch.log(1.0 - probs + 1e-7) * probs.pow(gamma_neg)
-        
-        batch_loss = - (loss_pos + (beta_neg * loss_neg))
-        return batch_loss.sum(dim=-1).mean()
+        # 4. Cross Entropy
+        loss_pos = -targets * torch.log(p_pos.clamp(min=self.eps))
+        loss_neg = -(1.0 - targets) * torch.log(p_neg.clamp(min=self.eps))
+
+        # 5. Apply Gamma Modulation dynamically
+        if self.gamma_pos > 0:
+            loss_pos = loss_pos * torch.pow(1.0 - pt_pos, self.gamma_pos)
+        if self.gamma_neg > 0:
+            loss_neg = loss_neg * torch.pow(1.0 - pt_neg, self.gamma_neg)
+
+        return (loss_pos + loss_neg).sum(dim=-1).mean()
 
 class KendallMultiTaskLoss(nn.Module):
     """

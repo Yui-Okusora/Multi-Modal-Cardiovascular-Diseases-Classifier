@@ -1,6 +1,7 @@
 # scripts/test_all_modules.py
 import gc
 import time
+import json
 import argparse
 import torch
 import torch.nn as nn
@@ -15,7 +16,8 @@ from Pipeline import ClinicalPipeline
 from src.ModelModules import (
     UnifiedSystemicEmbedder,
     PerceiverLatentPooling,
-    LinearProbeHead
+    LinearProbeHead,
+    LabelAttentiveProbe,
 )
 
 import logging
@@ -25,22 +27,29 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 
 
-def create_benchmark_batch(cfg: CardioConfig, benchmark_bs: int, num_feats: int = 100, num_cats: int = 50) -> Dict[str, Any]:
+def create_benchmark_batch(
+    cfg: CardioConfig, 
+    benchmark_bs: int, 
+    num_feats: int, 
+    num_cats: int,
+    num_cls: int
+) -> Dict[str, Any]:
     L = cfg.max_sequence_len
     subwords = cfg.max_subwords
     device = cfg.device
     return {
         'patient_session_id': [f"pat_{i}" for i in range(benchmark_bs)],
-        'feature_ids': torch.randint(1, num_feats, (benchmark_bs, L), device=device),
+        'feature_ids': torch.randint(0, num_feats, (benchmark_bs, L), device=device),
         'numeric_values': torch.randn(benchmark_bs, L, device=device),
         'cat_result_ids': torch.randint(0, num_cats, (benchmark_bs, L, subwords), device=device),
         'timestamps': torch.sort(torch.rand(benchmark_bs, L, device=device) * 100.0, dim=-1, descending=True)[0],
         'base_mask': torch.zeros(benchmark_bs, L, dtype=torch.bool, device=device),
         'student_mask': torch.zeros(benchmark_bs, L, dtype=torch.bool, device=device),
         'teacher_mask': torch.zeros(benchmark_bs, L, dtype=torch.bool, device=device),
+        'dt_target': torch.rand(benchmark_bs, device=device) * 24.0,
         'age': torch.rand(benchmark_bs, device=device),
         'gender': torch.randint(1, 3, (benchmark_bs,), device=device),
-        'icd_targets': torch.randint(0, 456, (benchmark_bs, cfg.max_targets), device=device),
+        'icd_targets': torch.randint(0, num_cls, (benchmark_bs, cfg.max_targets), device=device),
         'target_mask': torch.zeros(benchmark_bs, cfg.max_targets, dtype=torch.bool, device=device)
     }
 
@@ -52,6 +61,13 @@ class VRAMFootprintProfiler:
         self.use_amp = cfg.use_amp
         self.amp_dtype = cfg.amp_dtype
         self.benchmark_bs = benchmark_bs if benchmark_bs is not None else cfg.batch_size
+
+        with open(cfg.codebook_json_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)["metadata"]
+
+        self.num_feats = meta['num_total_features']
+        self.num_cats = meta['num_cat_results']
+        self.num_cls = meta['num_icd_classes']
         
         if torch.cuda.is_available():
             total_mem = torch.cuda.get_device_properties(self.device).total_memory / (1024 ** 3)
@@ -60,7 +76,13 @@ class VRAMFootprintProfiler:
             if alloc_mem > 2.0 and self.benchmark_bs == self.cfg.batch_size:
                 self.benchmark_bs = min(64, self.benchmark_bs)
 
-        self.batch = create_benchmark_batch(self.cfg, benchmark_bs=self.benchmark_bs)
+        self.batch = create_benchmark_batch(
+            self.cfg, 
+            benchmark_bs=self.benchmark_bs,
+            num_feats=self.num_feats,
+            num_cats=self.num_cats,
+            num_cls=self.num_cls
+        )
 
     def get_static_memory_stats(self, module: Optional[nn.Module]) -> Tuple[int, int, float]:
         if module is None or not isinstance(module, nn.Module): return 0, 0, 0.0
@@ -114,14 +136,12 @@ class VRAMFootprintProfiler:
         pipeline = ClinicalPipeline(self.cfg, self.device)
         pipeline.inject_phase2_infrastructure()
 
-        num_feats = pipeline.meta['num_total_features']
-        num_cats  = pipeline.meta['num_cat_results']
-        num_cls   = pipeline.num_icd_classes
         D, K, K_aug = self.cfg.latent_dim, self.cfg.num_slots, pipeline.augmented_slots
 
-        tokenizer      = UnifiedSystemicEmbedder(num_feats, num_cats, d_model=D, num_frequencies=self.cfg.fourier_frequencies).to(self.device)
+        tokenizer      = UnifiedSystemicEmbedder(self.num_feats, self.num_cats, d_model=D, num_frequencies=self.cfg.fourier_frequencies).to(self.device)
         perceiver      = PerceiverLatentPooling(num_slots=K, d_model=D).to(self.device)
-        probe_linear   = LinearProbeHead(in_slots=K_aug, in_dim=D, num_classes=num_cls, dropout_p=self.cfg.probe_dropout).to(self.device)
+        probe_linear   = LinearProbeHead(in_slots=K_aug, in_dim=D, num_classes=self.num_cls, dropout_p=self.cfg.probe_dropout).to(self.device)
+        probe_laat     = LabelAttentiveProbe(in_dim=D, num_classes=self.num_cls, dropout_p=self.cfg.probe_dropout).to(self.device)
 
         f_ids  = self.batch['feature_ids'].to(self.device)
         v_nums = self.batch['numeric_values'].to(self.device)
@@ -142,8 +162,9 @@ class VRAMFootprintProfiler:
             ("Context Encoder Backbone", pipeline.context_encoder, (f_ids, v_nums, c_ids, times, s_mask)),
             ("JEPA Predictor Network", pipeline.predictor, (z_c_raw,)),
             ("Manifold Assembler", pipeline.assembler, (z_c_raw, age, gender)),
-            ("Label Probe (Modern Hopfield)", pipeline.probe, (z_final,)),
-            ("Baseline Linear Probe Head", probe_linear, (z_final,)),
+            ("Hopfield Memory", pipeline.hopfield, (z_final,)),
+            ("Label Attentive Probe", probe_laat, (z_final,)),
+            ("Linear Probe Head", probe_linear, (z_final,)),
             ("Auxiliary Cardinality Head", pipeline.cardinal, (z_final,)),
             ("E2E Phase 1 Pretraining Pass", lambda b: pipeline.process_batch(b, self.device, run_teacher=True), (self.batch,)),
             ("E2E Phase 2 Probing Pass", lambda b: pipeline.process_batch(b, self.device, run_teacher=False), (self.batch,))

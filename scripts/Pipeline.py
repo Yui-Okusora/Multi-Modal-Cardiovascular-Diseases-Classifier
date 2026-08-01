@@ -8,8 +8,8 @@ from typing import Dict, Any, Optional
 
 from config import CardioConfig
 from src.ModelModules import (
-    ContextEncoder, Predictor, PatientManifoldAssembler, 
-    LinearProbeHead, LabelAttentiveSlotProbe, AuxiliaryCardinalityHead
+    ContextEncoder, Predictor, PatientManifoldAssembler, ContinuousHopfieldMemory,
+    LinearProbeHead, LabelAttentiveProbe, AuxiliaryCardinalityHead
 )
 from src.LoRAWrapper import inject_lora_infrastructure
 
@@ -54,6 +54,7 @@ class ClinicalPipeline:
         ).to(device)
         
         self.augmented_slots = cfg.augmented_slots
+        self.hopfield = None
         self.probe = None
         self.cardinal = None
 
@@ -65,9 +66,16 @@ class ClinicalPipeline:
                 alpha=self.cfg.lora_alpha,
                 target_names=self.cfg.lora_target_names
             )
+
+        if self.cfg.use_hopfield_memory:
+            self.hopfield = ContinuousHopfieldMemory(
+                in_dim=self.cfg.latent_dim,
+                num_prototypes=self.cfg.num_prototypes,
+                num_heads=self.cfg.num_hopfield_heads
+            ).to(self.device)
         
         if self.cfg.probe_type == "attentive":
-            self.probe = LabelAttentiveSlotProbe(
+            self.probe = LabelAttentiveProbe(
                 in_slots=self.augmented_slots, 
                 in_dim=self.cfg.latent_dim, 
                 num_classes=self.num_icd_classes,
@@ -109,6 +117,7 @@ class ClinicalPipeline:
         state = {
             'context_encoder_state': self.context_encoder.state_dict(), 
             'assembler_state':       self.assembler.state_dict(),
+            'hopfield_state':        self.hopfield.state_dict() if self.hopfield is not None else None,
             'probe_state':           self.probe.state_dict() if self.probe is not None else None, 
             'cardinal_state':        self.cardinal.state_dict() if self.cardinal is not None else None,
         }
@@ -131,6 +140,12 @@ class ClinicalPipeline:
             self.context_encoder.load_state_dict(weights['context_encoder_state'], strict=False)
         if 'assembler_state' in weights: 
             self.assembler.load_state_dict(weights['assembler_state'], strict=strict)
+
+        if weights.get('hopfield_state') is not None:
+            if self.hopfield is None and self.cfg.use_hopfield_memory: 
+                self.inject_phase2_infrastructure()
+            if self.hopfield is not None:
+                self.hopfield.load_state_dict(weights['hopfield_state'], strict=strict)
 
         # 2. Hardcoded Phase 2 Heads
         if weights.get('probe_state') is not None:
@@ -161,7 +176,10 @@ class ClinicalPipeline:
         )
 
         if run_teacher:
-            z_hat = self.predictor(z_c_raw)
+            dt_target = batch['dt_target'].to(device).unsqueeze(-1)  # Shape: [B, 1]
+            future_time_emb = self.context_encoder.tokenizer.time_embedder(dt_target)  # Shape: [B, 1, 512]
+
+            z_hat = self.predictor(z_c_raw, future_time_emb=future_time_emb)
             with torch.no_grad():
                 z_t = self.target_encoder(
                     feature_ids=batch['feature_ids'].to(device), 
@@ -181,13 +199,21 @@ class ClinicalPipeline:
             z_hat, z_t = None, None
             logits, predicted_cardinalities = None, None
             if self.probe is not None:
-                logits = self.probe(z_c_final)
                 predicted_cardinalities = self.cardinal(z_c_final)
 
+                if self.hopfield is not None:
+                    z_c_final = self.hopfield(z_c_final)
+                logits = self.probe(z_c_final)
+
+        icd_targets = batch['icd_targets'].to(device).long()
+        target_mask = batch['target_mask'].to(device)
+
+        valid_indices = icd_targets.masked_fill(target_mask, -1)
+        valid_mask = (valid_indices >= 0) & (valid_indices < self.num_icd_classes)
+        
+        safe_indices = valid_indices.clamp(min=0, max=self.num_icd_classes - 1)
         multi_hot = torch.zeros(B, self.num_icd_classes, device=device)
-        for b_idx in range(B):
-            valid_targets = batch['icd_targets'][b_idx][~batch['target_mask'][b_idx]].to(device)
-            multi_hot[b_idx, valid_targets] = 1.0
+        multi_hot.scatter_(1, safe_indices, valid_mask.float())
 
         return {
             'z_c_slots': z_c_final, 

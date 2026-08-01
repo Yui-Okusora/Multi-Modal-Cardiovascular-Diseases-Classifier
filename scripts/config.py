@@ -55,16 +55,17 @@ class CardioConfig:
     nhead: int = 8                         # Transformer attention heads
     fourier_frequencies: int = 32          # Fourier frequency channels for numerical embeddings
     
-    probe_type: str = "attentive"          # Options: "attentive" (Hopfield+LAAT) or "linear"
-    num_prototypes: int = 64               # Hopfield memory prototype centroids
+    probe_type: str = "linear"             # Options: "laat" or "linear"
+    use_hopfield_memory: bool = True       # Toggle Hopfield memory
+    num_prototypes: int = 128              # Hopfield memory prototype centroids
     num_hopfield_heads: int = 8            # Subspace heads in Modern Hopfield layer
-    probe_dropout: float = 0.20
+    probe_dropout: float = 0.30
     covariate_scale: float = 0.50          # L2 norm scaling factor for static age/gender tokens
 
     # ─── 4. LORA ADAPTER CONFIGURATION ───
     encoder_lora: bool = True
     lora_rank: int = 16
-    lora_alpha: float = 32.0
+    lora_alpha: float = 16.0
     lora_target_names: List[str] = field(default_factory=lambda: [
         "linear1", "linear2", "channel_mlp", "slot_combiner"
     ])
@@ -85,10 +86,10 @@ class CardioConfig:
     alpha_align: float = 25.0              # L1 Smooth Alignment Loss weight
     alpha_var: float = 25.0                # Projected VICReg Variance Loss weight
     alpha_backbone_v: float = 150.0        # Direct Backbone Variance Loss weight
-    alpha_cov: float = 150.0               # Projected VICReg Covariance Loss weight
+    alpha_cov: float = 75.0               # Projected VICReg Covariance Loss weight
     alpha_diverse: float = 25.0            # Cross-slot orthogonal diversity loss weight
     alignment_smooth_l1_beta: float = 0.5
-    target_std: float = 0.20               # Target feature standard deviation floor
+    target_std: float = 0.22               # Target feature standard deviation floor
     tau: float = 0.996                     # Momentum EMA coefficient for Target Encoder
     pretrain_lr: float = 4.2e-4
     pretrain_epochs: int = 20
@@ -96,33 +97,33 @@ class CardioConfig:
     pretrain_warmup_ratio: float = 0.15
 
     # ─── 7. PHASE 2: DOWNSTREAM PROBE FITTING ───
-    probe_lr: float = 2e-4
+    probe_lr: float = 1.5e-4
     probe_lr_backbone_scale: float = 0.25  # Scaler for fine-tuning backbone LoRA weights
     probe_lr_assembler_scale: float = 0.50 # Scaler for Manifold Assembler weights
     probe_epochs: int = 20
-    probe_wgt_decay: float = 1e-4
+    probe_wgt_decay: float = 1e-2
     
     # Class-Aware Asymmetric Loss (ASL) Hyperparameters
+    asl_gamma_neg: float = 4.5        # Bounded base exponent to prevent precision collapse
     asl_gamma_pos: float = 0.0
-    asl_gamma_neg_base: float = 1.0        # Bounded base exponent to prevent precision collapse
-    asl_beta_neg_base: float = 1.0
-    asl_delta_beta: float = 0.5            # Dynamic boost for rare long-tail classes
+    asl_clip: float = 0.05
+    asl_eps:float = 1e-8
     
     # Phase 2 Multi-Task Loss Weighting
-    loss_weight_cls: float = 1.00
+    loss_weight_cls: float = 4.00
     loss_weight_cardinality_mse: float = 0.05
-    loss_weight_prototype_diversity: float = 1.00
-    loss_weight_label_cooccurrence: float = 15.0
-    proto_loss_scale: float = 100.0
+    loss_weight_prototype_diversity: float = 15.0
+    loss_weight_label_cooccurrence: float = 100.0
 
     # ─── 8. PHASE 2 MODEL SELECTION SCORECARD (STRATEGY 2: HARMONIC) ───
     harmonic_core_weight: float = 0.90     # Weight for Harmonic Mean of (PR-AUC, F1, Adaptive Precision)
     top5_rate_weight: float = 0.10         # Weight for Top-5 Differential Coverage Safety Net
 
     # ─── 9. EVALUATION & SAFETY CALIBRATION ───
-    eval_temp_alpha: float = 0.15          # Temperature scaling alpha for rare-class un-suppression
+    eval_temp_alpha: float = 0.10          # Temperature scaling alpha for rare-class un-suppression
     eval_flat_threshold: float = 0.15       # Fixed anchor decision threshold for baseline audit
     min_positive_prevalence: int = 2       # Minimum positive validation samples required per class
+    calibration_beta: int = 2.0
 
     # ─── 10. XAI ANALYTICS & VISUALIZATION ───
     xai_max_samples: int = 3000
