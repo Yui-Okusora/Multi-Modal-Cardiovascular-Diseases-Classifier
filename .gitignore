@@ -81,14 +81,15 @@ checkpoints/
 # ==============================================================================
 # 5. XAI EXPORTS, PLOTS & LOGS
 # ==============================================================================
-exports*./
-*.png
+exports/
+xai_exports/
+exports_baseline/
+
 *.jpg
 *.jpeg
 *.svg
 *.pdf
 *.log
-*.html
 
 # Telemetry CSV exports inside checkpoints or root
 telemetry_*.csv
